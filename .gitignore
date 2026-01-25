@@ -1,0 +1,9 @@
+venv/
+token.json
+credentials.json
+processed_messages.txt
+transactions.csv
+last_upload_date.txt
+*.log
+*.err
+.DS_Store
