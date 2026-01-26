@@ -125,6 +125,39 @@ def save_processed_messages(processed_ids):
         for msg_id in processed_ids:
             f.write(f"{msg_id}\n")
 
+def process_recurring_expenses(processed_ids, benefits):
+    """
+    Checks for recurring expenses that should be logged today.
+    """
+    path = "recurring_expenses.json"
+    if not os.path.exists(path):
+        return False
+
+    with open(path, "r") as f:
+        recurring = json.load(f)
+
+    now = datetime.now()
+    new_found = False
+    
+    # We'll open the file in the main logic, but for recurring we can just return the objects
+    to_log = []
+
+    for item in recurring:
+        # Check if today is the day (or if we past the day but haven't logged it for this month yet)
+        # To be safe and simple: if today is >= scheduled day and we haven't logged it for this MONTH/YEAR yet.
+        pseudo_id = f"{item['id_prefix']}_{now.strftime('%Y_%m')}"
+        
+        if now.day >= item['day'] and pseudo_id not in processed_ids:
+            transaction = {
+                "date": now.strftime("%Y-%m-%d"), # Log it as today
+                "amount": str(item['amount']),
+                "merchant": item['name']
+            }
+            to_log.append((transaction, pseudo_id))
+            new_found = True
+
+    return to_log
+
 def main():
     """
     Scans Gmail for new transaction emails and appends them to a CSV file.
@@ -149,6 +182,9 @@ def main():
     new_transactions_found = False
 
     try:
+        # --- Handle Recurring Expenses First ---
+        recurring_to_log = process_recurring_expenses(processed_message_ids, benefits)
+        
         results = (
             service.users()
             .messages()
@@ -156,10 +192,6 @@ def main():
             .execute()
         )
         messages = results.get("messages", [])
-
-        if not messages:
-            print("No new transaction messages found.")
-            return
 
         file_exists = os.path.exists("transactions.csv")
         with open("transactions.csv", "a", newline="") as csvfile:
@@ -169,9 +201,17 @@ def main():
             if not file_exists:
                 writer.writeheader()
 
+            for transaction, pseudo_id in recurring_to_log:
+                if not new_transactions_found:
+                    print("New transactions found (including recurring):")
+                    new_transactions_found = True
+                
+                writer.writerow(transaction)
+                print(f"Logged recurring transaction: {transaction}")
+                check_benefits(transaction, benefits)
+                processed_message_ids.add(pseudo_id)
+
             for message in messages:
-                if message["id"] in processed_message_ids:
-                    continue
 
                 if not new_transactions_found:
                     print("New transactions found:")
