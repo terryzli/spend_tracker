@@ -7,3 +7,4 @@ last_upload_date.txt
 *.log
 *.err
 .DS_Store
+recurring_expenses.json
