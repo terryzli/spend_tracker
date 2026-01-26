@@ -9,7 +9,7 @@
   "amex_gold": {
     "dunkin_credit": {
       "keywords": ["dunkin donut"],
-      "total": 10,
+      "total": 7,
       "reset_cycle": "monthly"
     },
     "uber_credit": {
