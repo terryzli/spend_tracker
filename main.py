@@ -287,27 +287,40 @@ def main():
                             break
                     print(f"--> FAILED TO PARSE: Subject: '{subject}'")
 
-        if new_transactions_found:
-            # Sort the transactions file after all new entries are added
-            all_transactions = []
+        # --- Finalize and Deduplicate CSV ---
+        # We do this every time to ensure the file is always sorted, 
+        # cumulative totals are correct, and no duplicates exist.
+        if os.path.exists("transactions.csv"):
+            all_rows = []
             with open("transactions.csv", "r", newline="") as csvfile:
                 reader = csv.DictReader(csvfile)
-                all_transactions = list(reader)
+                all_rows = list(reader)
             
-            # Sort by date
-            all_transactions.sort(key=lambda x: x['date'])
-            
-            # Calculate cumulative amount
-            running_total = 0.0
-            for row in all_transactions:
-                running_total += float(row['amount'])
-                row['cumulative_amount'] = round(running_total, 2)
-            
-            with open("transactions.csv", "w", newline="") as csvfile:
-                fieldnames = ["date", "amount", "merchant", "cumulative_amount"]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(all_transactions)
+            if all_rows:
+                # Deduplicate based on date, amount, and merchant
+                unique_rows = []
+                seen_rows = set()
+                for row in all_rows:
+                    # Create a tuple of the core data to use as a key
+                    row_key = (row['date'], row['amount'], row['merchant'])
+                    if row_key not in seen_rows:
+                        unique_rows.append(row)
+                        seen_rows.add(row_key)
+                
+                # Sort by date
+                unique_rows.sort(key=lambda x: x['date'])
+                
+                # Recalculate cumulative amount
+                running_total = 0.0
+                for row in unique_rows:
+                    running_total += float(row['amount'])
+                    row['cumulative_amount'] = round(running_total, 2)
+                
+                with open("transactions.csv", "w", newline="") as csvfile:
+                    fieldnames = ["date", "amount", "merchant", "cumulative_amount"]
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(unique_rows)
 
     except HttpError as error:
         print(f"An error occurred: {error}")
