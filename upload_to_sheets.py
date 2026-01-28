@@ -64,7 +64,9 @@ def main():
                 row['cumulative_amount'] = round(running_total, 2)
             
             if header:
-                values_to_upload.append(header)
+                # Capitalize headers for better presentation in Sheets
+                display_header = [col.replace('_', ' ').title() for col in header]
+                values_to_upload.append(display_header)
             
             # Convert dict rows back to lists for Google Sheets API
             for row in rows:
