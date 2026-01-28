@@ -59,17 +59,17 @@ def parse_with_gemini(body):
     print(f"  -> Attempting Gemini AI parsing (Call {usage + 1}/{DAILY_LIMIT})...")
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Using 2.0 Flash as verified from list_models
+        model = genai.GenerativeModel('gemini-2.0-flash')
         
         # Clean the body for the prompt
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
-        clean_text = ' '.join(soup_text.split())[:3000] # Limit input size
+        clean_text = ' '.join(soup_text.split())[:3000] 
         
         prompt = f"""
-        Extract transaction details from this email. 
+        Extract transaction details from this financial alert email. 
         Return ONLY a JSON object with keys: 'amount' (number as string), 'merchant' (string), and 'date' (YYYY-MM-DD).
-        If multiple transactions exist, just return the main one.
-        If no transaction is found, return null.
+        Return null if no transaction is found.
         
         Email content:
         {clean_text}
@@ -78,16 +78,13 @@ def parse_with_gemini(body):
         response = model.generate_content(prompt)
         increment_gemini_usage()
         
-        # Extract JSON from response (handling potential markdown blocks)
-        json_str = response.text.strip()
-        if "```json" in json_str:
-            json_str = json_str.split("```json")[1].split("```")[0].strip()
-        elif "```" in json_str:
-            json_str = json_str.split("```")[1].split("```")[0].strip()
-            
-        data = json.loads(json_str)
-        if data and all(k in data for k in ['amount', 'merchant', 'date']):
-            return data
+        text_response = response.text.strip()
+        # Basic JSON extraction logic
+        if "{" in text_response:
+            json_str = text_response[text_response.find("{"):text_response.rfind("}")+1]
+            data = json.loads(json_str)
+            if data and all(k in data for k in ['amount', 'merchant', 'date']):
+                return data
     except Exception as e:
         print(f"  !! Gemini parsing failed: {e}")
     
