@@ -5,8 +5,7 @@ import csv
 import json
 from datetime import datetime
 from bs4 import BeautifulSoup # ADD THIS IMPORT
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -59,7 +58,9 @@ def parse_with_gemini(body):
 
     print(f"  -> Attempting Gemini AI parsing (Call {usage + 1}/{DAILY_LIMIT})...")
     try:
-        client = genai.Client(api_key=api_key)
+        genai.configure(api_key=api_key)
+        # Using 2.0 Flash Lite for better free-tier availability
+        model = genai.GenerativeModel('gemini-2.0-flash-lite')
         
         # Clean the body for the prompt
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
@@ -74,17 +75,16 @@ def parse_with_gemini(body):
         {clean_text}
         """
         
-        response = client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type='application/json'
-            )
+        response = model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
         )
         increment_gemini_usage()
         
-        data = response.parsed if hasattr(response, 'parsed') else json.loads(response.text)
+        data = json.loads(response.text.strip())
         if data and all(k in data for k in ['amount', 'merchant', 'date']):
+            # Ensure amount is a string representing a float
+            data['amount'] = str(data['amount']).replace('$', '').replace(',', '')
             return data
     except Exception as e:
         print(f"  !! Gemini parsing failed: {e}")
@@ -110,6 +110,10 @@ def parse_email_body(body):
         # Pattern: "charged $X at Y."
         # Use \s+ to handle potential newlines or multiple spaces between words
         match = re.search(r"charged\s+\$(?P<amount>[\d.]+)\s+at\s+(?P<merchant>[^.]+)\.", soup_text, re.DOTALL)
+        if not match:
+            # Try a variant for forwarded emails or different phrasing
+            match = re.search(r"Amount:\s+\$(?P<amount>[\d.]+).*?Merchant:\s+(?P<merchant>[^.\n]+)", soup_text, re.DOTALL | re.IGNORECASE)
+            
         if match:
             res = match.groupdict()
             # Clean up merchant name (remove extra whitespace/newlines)
@@ -278,7 +282,7 @@ def main():
         results = (
             service.users()
             .messages()
-            .list(userId="me", q='\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\" OR \"Credit card transaction exceeds alert limit you set\"')
+            .list(userId="me", q='\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\" OR \"Credit card transaction exceeds alert limit you set\" OR \"Fwd: Large Purchase Approved\" OR \"Fwd: Your U.S. Bank credit card has a new transaction\"')
             .execute()
         )
         messages = results.get("messages", [])
