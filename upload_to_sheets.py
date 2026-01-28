@@ -63,16 +63,16 @@ def main():
                 running_total += float(row['amount'])
                 row['cumulative_amount'] = round(running_total, 2)
             
-            if header:
-                # Capitalize headers for better presentation in Sheets
-                display_header = [col.replace('_', ' ').title() for col in header]
-                values_to_upload.append(display_header)
+            # Explicitly define headers to ensure they appear in Sheets
+            display_headers = ["Date", "Amount", "Merchant", "Cumulative Amount"]
+            values_to_upload.append(display_headers)
             
-            # Convert dict rows back to lists for Google Sheets API
+            # Use original keys to extract values from dicts
+            data_keys = ["date", "amount", "merchant", "cumulative_amount"]
             for row in rows:
-                values_to_upload.append([row.get(col, '') for col in header])
+                values_to_upload.append([row.get(k, '') for k in data_keys])
 
-        if not values_to_upload or (len(values_to_upload) == 1 and header):
+        if len(values_to_upload) <= 1:
             print("No transaction data to upload.")
             return
 
