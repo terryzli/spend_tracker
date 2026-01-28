@@ -45,7 +45,33 @@ def parse_email_body(body):
     except Exception:
         pass
 
-    # 2. If simple regex fails, try specific HTML structure parsing (e.g., for Amex)
+    # 2. Try Bank of America specific parsing
+    try:
+        # Bank of America emails have a very specific table structure with labels
+        if "bankofamerica.com" in body or "Bank of America" in body:
+            soup = BeautifulSoup(body, 'html.parser')
+            text = soup.get_text(separator=' ')
+            
+            amount_match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+)", text)
+            merchant_match = re.search(r"Where:\s+(?P<merchant>.+?)(?:\s{2,}|\n|$)", text)
+            date_match = re.search(r"Date:\s+(?P<date>\w+\s+\d{1,2},\s+\d{4})", text)
+            
+            if amount_match and merchant_match:
+                amount = amount_match.group('amount').replace(',', '')
+                merchant = merchant_match.group('merchant').strip()
+                res = {"amount": amount, "merchant": merchant}
+                
+                if date_match:
+                    try:
+                        date_obj = datetime.strptime(date_match.group('date'), '%B %d, %Y')
+                        res['date'] = date_obj.strftime('%Y-%m-%d')
+                    except ValueError:
+                        pass
+                return res
+    except Exception:
+        pass
+
+    # 3. If simple regex fails, try specific HTML structure parsing (e.g., for Amex)
     try:
         soup = BeautifulSoup(body, 'html.parser')
         
@@ -188,7 +214,7 @@ def main():
         results = (
             service.users()
             .messages()
-            .list(userId="me", q='\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\"')
+            .list(userId="me", q='\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\" OR \"Credit card transaction exceeds alert limit you set\"')
             .execute()
         )
         messages = results.get("messages", [])
