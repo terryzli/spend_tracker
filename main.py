@@ -5,7 +5,8 @@ import csv
 import json
 from datetime import datetime
 from bs4 import BeautifulSoup # ADD THIS IMPORT
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -58,9 +59,7 @@ def parse_with_gemini(body):
 
     print(f"  -> Attempting Gemini AI parsing (Call {usage + 1}/{DAILY_LIMIT})...")
     try:
-        genai.configure(api_key=api_key)
-        # Using 2.0 Flash as verified from list_models
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        client = genai.Client(api_key=api_key)
         
         # Clean the body for the prompt
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
@@ -75,16 +74,18 @@ def parse_with_gemini(body):
         {clean_text}
         """
         
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type='application/json'
+            )
+        )
         increment_gemini_usage()
         
-        text_response = response.text.strip()
-        # Basic JSON extraction logic
-        if "{" in text_response:
-            json_str = text_response[text_response.find("{"):text_response.rfind("}")+1]
-            data = json.loads(json_str)
-            if data and all(k in data for k in ['amount', 'merchant', 'date']):
-                return data
+        data = response.parsed if hasattr(response, 'parsed') else json.loads(response.text)
+        if data and all(k in data for k in ['amount', 'merchant', 'date']):
+            return data
     except Exception as e:
         print(f"  !! Gemini parsing failed: {e}")
     
