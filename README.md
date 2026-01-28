@@ -1,96 +1,62 @@
 # Gmail Spending Tracker
 
-This project provides a Python script to track your spending by scraping transaction emails from your Gmail account. It automatically categorizes spending, tracks progress towards credit card benefits, and syncs data to Google Sheets and Home Assistant.
+An automated financial tool that scrapes transaction emails from Gmail, categorizes spending, tracks credit card benefits, and syncs data to Google Sheets and Home Assistant.
 
 ## Features
 
-- **Automated Scraping**: Scans Gmail for transaction alerts from U.S. Bank and American Express.
-- **Robust Parsing**: Handles various email formats including plain text and complex HTML (Amex).
-- **Recurring Expenses**: Supports scheduled monthly expenses (e.g., donations, subscriptions) via a local configuration file.
-- **Benefit Tracking**: Real-time progress tracking for specific credit card credits (Amex Dining, Uber, etc.).
-- **Smart Data Management**:
-  - Automatic chronological sorting by date.
-  - **Cumulative Spending**: A running total column helps you see your total spend over time.
-  - Duplicate prevention using unique Gmail message IDs.
+- **Multi-Bank Support**: Automated regex parsing for:
+  - **U.S. Bank**: "Large Purchase" and "New Transaction" alerts.
+  - **American Express**: Standard transaction notifications.
+  - **Bank of America**: "Transaction exceeds limit" alerts.
+  - **Capital One**: "New transaction charged" alerts (Venture X, etc.).
+- **AI-Powered Fallback**: Uses the latest **Gemini 2.5 Flash Lite** (via the modern `google-genai` SDK) to parse unknown email formats if regex fails.
+- **Recurring Expenses**: Support for scheduled monthly transactions (e.g., donations, rent) via a private `recurring_expenses.json`.
+- **Advanced Data Management**:
+  - **Deduplication**: Every run automatically cleans the CSV of duplicate entries.
+  - **Chronological Sorting**: Transactions are always kept in order by date.
+  - **Cumulative Spending**: A running total column is automatically calculated and synced.
 - **Integrations**:
-  - **Google Sheets**: Daily automated upload of your full transaction history.
-  - **Home Assistant**: Custom sensors for monthly/yearly spend and benefit progress.
+  - **Google Sheets**: Daily automated upload to a dedicated `Transactions` sheet (Dashboard friendly).
+  - **Home Assistant**: REST/Command Line sensors for real-time spending and benefit progress.
 
 ## Setup Instructions
 
-To get started, you'll need to create a project in the Google Cloud Console, enable the Gmail and Google Sheets APIs, and download your credentials.
+### 1. Google Cloud Configuration
+- Enable the **Gmail API**, **Google Sheets API**, and **Generative Language API** in the [Google Cloud Console](https://console.cloud.google.com/).
+- Create an **OAuth 2.0 Client ID** (Desktop app) and save the JSON as `credentials.json` in the project root.
+- Generate a Gemini API Key at [Google AI Studio](https://aistudio.google.com/app/apikey) and save it in `gemini_key.txt`.
 
-**Step 1: Go to the Google Cloud Console**
-   - Open your web browser and navigate to the [Google Cloud Console](https://console.cloud.google.com/).
-   - If you don't have a project already, create a new one.
+### 2. Local Configuration
+Create these files locally (they are ignored by Git for privacy):
+- `gemini_key.txt`: Your Gemini API key string.
+- `recurring_expenses.json`: (Optional)
+  ```json
+  [{"name": "Donation", "amount": 50.00, "day": 29, "id_prefix": "donation_id"}]
+  ```
 
-**Step 2: Enable APIs**
-   - Enable the **Gmail API** and the **Google Sheets API**.
-
-**Step 3: Create Credentials**
-   - Create an **OAuth 2.0 Client ID** (Desktop app).
-   - Download the JSON file, rename it to `credentials.json`, and move it into the `gmail_spending_tracker` directory.
-
-## Customization
-
-### Recurring Expenses
-You can add monthly recurring expenses by creating a `recurring_expenses.json` file in the project directory. This file is ignored by Git to protect your privacy.
-
-```json
-[
-    {
-        "name": "Description of Expense",
-        "amount": 100.00,
-        "day": 15,
-        "id_prefix": "unique_identifier"
-    }
-]
+### 3. Installation
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 ```
-The script will automatically log these on or after the specified day each month.
 
-### Benefit Tracking
-Edit `benefits.json` to define your credit cards and their respective benefits. You can set keywords for merchant matching and the total value of the credit.
+## Automating the Tracker
 
-### Bank Support
-The script currently supports:
-- **U.S. Bank**: "Large Purchase Approved" and "New Transaction" alerts.
-- **American Express**: Standard transaction notifications (parsed from HTML).
+### macOS (Launch Agent)
+1. Edit `com.user.gmailspendingtracker.plist` with your local paths.
+2. Move it to `~/Library/LaunchAgents/`.
+3. Load it: `launchctl load ~/Library/LaunchAgents/com.user.gmailspendingtracker.plist`.
 
-## Running the Script as a Daemon (macOS)
-
-1. Move the `.plist` file:
-   ```bash
-   mv ~/gmail_spending_tracker/com.user.gmailspendingtracker.plist ~/Library/LaunchAgents/
-   ```
-2. Load the job:
-   ```bash
-   launchctl load ~/Library/LaunchAgents/com.user.gmailspendingtracker.plist
-   ```
-
-## Running the Script as a Daemon (Home Assistant)
-
-Add the following to your "Advanced SSH & Web Terminal" add-on `startup_commands`:
-
+### Home Assistant (Raspberry Pi)
+Add the following to your "Advanced SSH & Web Terminal" add-on configuration:
 ```yaml
 startup_commands:
   - 'cd /config/gmail_spending_tracker && nohup ./start_daemon.sh &'
   - 'cd /config/gmail_spending_tracker && nohup ./upload_daemon.sh &'
 ```
 
-### Home Assistant Sensor Configuration
-
-Add `command_line` sensors to your `configuration.yaml` to display your data:
-
-```yaml
-sensor:
-  - platform: command_line
-    name: "Monthly Spending"
-    command: "/config/gmail_spending_tracker/venv/bin/python /config/gmail_spending_tracker/report.py"
-    value_template: "{{ value_json.monthly_spending }}"
-    unit_of_measurement: "$"
-    scan_interval: 3600
-```
-
 ## Security & Privacy
-- **Credentials**: `credentials.json` and `token.json` are excluded from Git.
-- **Transaction Data**: `transactions.csv` and `recurring_expenses.json` are excluded from Git to keep your financial details local and secure.
+- **Private Files**: `credentials.json`, `token.json`, `gemini_key.txt`, `transactions.csv`, and `recurring_expenses.json` are all excluded from Git.
+- **History**: The repository history has been purged of sensitive configurations.
+- **API Safety**: Gemini AI calls are strictly limited to 10 per day by default to stay within the free-tier quota.
