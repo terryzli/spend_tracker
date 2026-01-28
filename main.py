@@ -59,8 +59,8 @@ def parse_with_gemini(body):
     print(f"  -> Attempting Gemini AI parsing (Call {usage + 1}/{DAILY_LIMIT})...")
     try:
         genai.configure(api_key=api_key)
-        # Using 2.0 Flash Lite for better free-tier availability
-        model = genai.GenerativeModel('gemini-2.0-flash-lite')
+        # Using 2.5 Flash Lite as verified from the user's quota dashboard
+        model = genai.GenerativeModel('models/gemini-2.5-flash-lite')
         
         # Clean the body for the prompt
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
