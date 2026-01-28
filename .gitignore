@@ -8,3 +8,5 @@ last_upload_date.txt
 *.err
 .DS_Store
 recurring_expenses.json
+gemini_key.txt
+gemini_usage.json

@@ -5,6 +5,7 @@ import csv
 import json
 from datetime import datetime
 from bs4 import BeautifulSoup # ADD THIS IMPORT
+import google.generativeai as genai
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -18,7 +19,82 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+GEMINI_KEY_FILE = "gemini_key.txt"
+GEMINI_USAGE_FILE = "gemini_usage.json"
+DAILY_LIMIT = 10
+
+def get_gemini_usage_count():
+    """Returns the number of Gemini API calls made today."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    if os.path.exists(GEMINI_USAGE_FILE):
+        with open(GEMINI_USAGE_FILE, 'r') as f:
+            data = json.load(f)
+            if data.get("date") == today:
+                return data.get("count", 0)
+    return 0
+
+def increment_gemini_usage():
+    """Increments the Gemini API call count for today."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    count = get_gemini_usage_count() + 1
+    with open(GEMINI_USAGE_FILE, 'w') as f:
+        json.dump({"date": today, "count": count}, f)
+
+def parse_with_gemini(body):
+    """Uses Gemini AI to extract transaction data from email text."""
+    if not os.path.exists(GEMINI_KEY_FILE):
+        return None
+    
+    usage = get_gemini_usage_count()
+    if usage >= DAILY_LIMIT:
+        print(f"  !! Gemini daily limit reached ({DAILY_LIMIT}). Skipping AI parse.")
+        return None
+
+    with open(GEMINI_KEY_FILE, 'r') as f:
+        api_key = f.read().strip()
+    
+    if not api_key:
+        return None
+
+    print(f"  -> Attempting Gemini AI parsing (Call {usage + 1}/{DAILY_LIMIT})...")
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Clean the body for the prompt
+        soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
+        clean_text = ' '.join(soup_text.split())[:3000] # Limit input size
+        
+        prompt = f"""
+        Extract transaction details from this email. 
+        Return ONLY a JSON object with keys: 'amount' (number as string), 'merchant' (string), and 'date' (YYYY-MM-DD).
+        If multiple transactions exist, just return the main one.
+        If no transaction is found, return null.
+        
+        Email content:
+        {clean_text}
+        """
+        
+        response = model.generate_content(prompt)
+        increment_gemini_usage()
+        
+        # Extract JSON from response (handling potential markdown blocks)
+        json_str = response.text.strip()
+        if "```json" in json_str:
+            json_str = json_str.split("```json")[1].split("```")[0].strip()
+        elif "```" in json_str:
+            json_str = json_str.split("```")[1].split("```")[0].strip()
+            
+        data = json.loads(json_str)
+        if data and all(k in data for k in ['amount', 'merchant', 'date']):
+            return data
+    except Exception as e:
+        print(f"  !! Gemini parsing failed: {e}")
+    
+    return None
+
 def get_email_date(headers):
+# ... (rest of headers logic)
     for header in headers:
         if header["name"] == "Date":
             return header["value"]
@@ -31,7 +107,6 @@ def parse_email_body(body):
     Returns a dict with 'amount', 'merchant', and 'date'.
     """
     # 1. Try stripping HTML first to get clean text for regex matching
-    # This works for most U.S. Bank emails whether they are plain text or HTML
     try:
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
         # Pattern: "charged $X at Y."
@@ -71,37 +146,30 @@ def parse_email_body(body):
     except Exception:
         pass
 
-    # 3. If simple regex fails, try specific HTML structure parsing (e.g., for Amex)
+    # 3. Specific HTML structure parsing (e.g., for Amex)
     try:
         soup = BeautifulSoup(body, 'html.parser')
         
         # --- Amex specific parsing ---
         # Look for the section that contains the transaction details.
-        # Using a general class mj-column-per-50 to find the transaction detail columns
         transaction_columns = soup.find_all('div', class_=re.compile(r'mj-column-per-50'))
 
-        # Assuming the first mj-column-per-50 is merchant and the second is amount/date
         if len(transaction_columns) >= 2:
             merchant_column = transaction_columns[0]
             amount_date_column = transaction_columns[1]
 
-            # Extract merchant text from the first column
-            merchant_p_tag = merchant_column.find('p', string=True) # Changed text=True to string=True
-            
-            # Extract amount and date from the second column
-            amount_p_tag = amount_date_column.find('p', string=re.compile(r'\$[\d.]+')) # Changed text=re.compile to string=re.compile
-            date_p_tag = amount_date_column.find('p', string=re.compile(r'Mon|Tue|Wed|Thu|Fri|Sat|Sun, \w{3} \d{1,2}, \d{4}')) # Changed text=re.compile to string=re.compile
+            merchant_p_tag = merchant_column.find('p', string=True) 
+            amount_p_tag = amount_date_column.find('p', string=re.compile(r'\$[\d.]+'))
+            date_p_tag = amount_date_column.find('p', string=re.compile(r'Mon|Tue|Wed|Thu|Fri|Sat|Sun, \w{3} \d{1,2}, \d{4}'))
 
             if merchant_p_tag and amount_p_tag and date_p_tag:
                 merchant_text = merchant_p_tag.get_text(strip=True)
                 amount_text = amount_p_tag.get_text(strip=True)
                 date_text = date_p_tag.get_text(strip=True)
                 
-                # Extract amount (remove '$' and '*' if present)
                 amount_value_match = re.search(r'\$([\d.]+)', amount_text)
                 amount_value = amount_value_match.group(1) if amount_value_match else None
                 
-                # Amex date format: "Mon, Jan 12, 2026"
                 try:
                     amex_date_obj = datetime.strptime(date_text, '%a, %b %d, %Y')
                     formatted_date = amex_date_obj.strftime('%Y-%m-%d')
@@ -110,17 +178,15 @@ def parse_email_body(body):
                         return {
                             "amount": amount_value,
                             "merchant": merchant_text,
-                            "date": formatted_date # Return date parsed from HTML
+                            "date": formatted_date 
                         }
                 except ValueError:
-                    pass # Date parsing failed
-    
-    except Exception as e:
-        # Log the exception for debugging
-        print(f"Amex HTML parsing failed: {e}")
+                    pass
+    except Exception:
         pass
 
-    return None # If no match found by either method
+    # 4. Fallback to Gemini AI if everything else fails
+    return parse_with_gemini(body)
 
 def load_benefits():
     """Loads benefit configuration from benefits.json."""
