@@ -15,7 +15,7 @@ SCOPES = [
 # The ID of your Google Sheet.
 # Replace this with the ID you copied from the URL.
 SPREADSHEET_ID = "14upQxkTP0ZI3cfJTKzH0DcFnerBBvSy2RPy6Posgdow"
-RANGE_NAME = "A1"  # Start at the top-left cell
+RANGE_NAME = "Transactions!A1"  # Start at the top-left of the Transactions sheet
 
 def get_credentials():
     """Gets valid user credentials from storage or initiates the OAuth flow."""
@@ -75,9 +75,9 @@ def main():
             return
 
         # --- Clear the existing sheet data ---
-        print("Clearing existing data from sheet...")
+        print("Clearing existing data from Transactions sheet...")
         sheet.values().clear(
-            spreadsheetId=SPREADSHEET_ID, range="A1:Z"
+            spreadsheetId=SPREADSHEET_ID, range="Transactions!A1:Z"
         ).execute()
 
         # --- Write the new data to the sheet ---
