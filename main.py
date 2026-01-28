@@ -5,7 +5,8 @@ import csv
 import json
 from datetime import datetime
 from bs4 import BeautifulSoup # ADD THIS IMPORT
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -58,9 +59,8 @@ def parse_with_gemini(body):
 
     print(f"  -> Attempting Gemini AI parsing (Call {usage + 1}/{DAILY_LIMIT})...")
     try:
-        genai.configure(api_key=api_key)
-        # Using 2.5 Flash Lite as verified from the user's quota dashboard
-        model = genai.GenerativeModel('models/gemini-2.5-flash-lite')
+        # The new SDK handles versioning and model resolution more reliably
+        client = genai.Client(api_key=api_key)
         
         # Clean the body for the prompt
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
@@ -75,17 +75,22 @@ def parse_with_gemini(body):
         {clean_text}
         """
         
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"}
+        response = client.models.generate_content(
+            model='gemini-2.5-flash-lite',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type='application/json'
+            )
         )
         increment_gemini_usage()
         
-        data = json.loads(response.text.strip())
-        if data and all(k in data for k in ['amount', 'merchant', 'date']):
-            # Ensure amount is a string representing a float
-            data['amount'] = str(data['amount']).replace('$', '').replace(',', '')
-            return data
+        # The new SDK returns a structured response
+        if response.text:
+            data = json.loads(response.text.strip())
+            if data and all(k in data for k in ['amount', 'merchant', 'date']):
+                # Ensure amount is a string representing a float
+                data['amount'] = str(data['amount']).replace('$', '').replace(',', '')
+                return data
     except Exception as e:
         print(f"  !! Gemini parsing failed: {e}")
     
