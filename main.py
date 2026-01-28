@@ -122,7 +122,31 @@ def parse_email_body(body):
     except Exception:
         pass
 
-    # 2. Try Bank of America specific parsing
+    # 2. Try Capital One specific parsing
+    try:
+        if "capitalone.com" in body or "Capital One" in body:
+            soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
+            clean_text = ' '.join(soup_text.split())
+            
+            # Pattern: "that on [Date], at [Merchant], a pending ... amount of $[Amount]"
+            cap_match = re.search(r"that on (?P<date>\w+\s+\d{1,2},\s+\d{4}),\s+at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", clean_text, re.IGNORECASE)
+            
+            if cap_match:
+                amount = cap_match.group('amount').replace(',', '')
+                merchant = cap_match.group('merchant').strip()
+                date_str = cap_match.group('date')
+                
+                res = {"amount": amount, "merchant": merchant}
+                try:
+                    date_obj = datetime.strptime(date_str, '%B %d, %Y')
+                    res['date'] = date_obj.strftime('%Y-%m-%d')
+                except ValueError:
+                    pass
+                return res
+    except Exception:
+        pass
+
+    # 3. Try Bank of America specific parsing
     try:
         # Bank of America emails have a very specific table structure with labels
         if "bankofamerica.com" in body or "Bank of America" in body:
@@ -148,7 +172,7 @@ def parse_email_body(body):
     except Exception:
         pass
 
-    # 3. Specific HTML structure parsing (e.g., for Amex)
+    # 4. Specific HTML structure parsing (e.g., for Amex)
     try:
         soup = BeautifulSoup(body, 'html.parser')
         
@@ -282,7 +306,7 @@ def main():
         results = (
             service.users()
             .messages()
-            .list(userId="me", q='\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\" OR \"Credit card transaction exceeds alert limit you set\" OR \"Fwd: Large Purchase Approved\" OR \"Fwd: Your U.S. Bank credit card has a new transaction\"')
+            .list(userId="me", q='\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\" OR \"Credit card transaction exceeds alert limit you set\" OR \"Fwd: Large Purchase Approved\" OR \"Fwd: Your U.S. Bank credit card has a new transaction\" OR \"A new transaction was charged to your account\"')
             .execute()
         )
         messages = results.get("messages", [])
