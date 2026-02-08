@@ -26,18 +26,44 @@ def calculate_spending():
     with open(benefits_path, 'r') as f:
         benefits_config = json.load(f)
     
+    # Load manual adjustments
+    manual_path = os.path.join(script_dir, 'manual_credits.json')
+    manual_adjustments = {}
+    if os.path.exists(manual_path):
+        try:
+            with open(manual_path, 'r') as f:
+                manual_adjustments = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
     # Initialize report structure based on benefits config
     report = {
         'monthly_spending': 0,
         'yearly_spending': 0,
-        'benefits': {card: {benefit: {'spent': 0, 'total': details['total']} for benefit, details in card_benefits.items()} for card, card_benefits in benefits_config.items()}
+        'benefits': {card: {benefit: {'spent': 0, 'total': details['total'], 'remaining': details['total']} for benefit, details in card_benefits.items()} for card, card_benefits in benefits_config.items()}
     }
 
     now = datetime.now()
     # When running in HA, the timezone might be UTC. For accurate date comparison, let's use naive datetimes.
-    # A better solution would be to handle timezones consistently everywhere.
     now = now.astimezone().replace(tzinfo=None)
 
+    # --- Apply Manual Adjustments First (so they are included in the base) ---
+    def get_period_key(reset_cycle, date_obj):
+        if reset_cycle == 'monthly':
+            return date_obj.strftime('%Y-%m')
+        elif reset_cycle == 'annual':
+            return date_obj.strftime('%Y')
+        elif reset_cycle == 'biannual_jan_jun':
+            period = 1 if 1 <= date_obj.month <= 6 else 2
+            return f"{date_obj.year}-P{period}"
+        return 'all'
+
+    for card, card_benefits in benefits_config.items():
+        for benefit, details in card_benefits.items():
+            reset_cycle = details.get('reset_cycle', 'annual')
+            period_key = get_period_key(reset_cycle, now)
+            adj = manual_adjustments.get(card, {}).get(benefit, {}).get(period_key, 0)
+            report['benefits'][card][benefit]['spent'] += adj
 
     if not os.path.exists(transactions_path):
         return report
@@ -90,7 +116,10 @@ def calculate_spending():
     report['yearly_spending'] = round(report['yearly_spending'], 2)
     for card in report['benefits']:
         for benefit in report['benefits'][card]:
-            report['benefits'][card][benefit]['spent'] = round(report['benefits'][card][benefit]['spent'], 2)
+            spent = round(report['benefits'][card][benefit]['spent'], 2)
+            total = report['benefits'][card][benefit]['total']
+            report['benefits'][card][benefit]['spent'] = spent
+            report['benefits'][card][benefit]['remaining'] = round(max(0, total - spent), 2)
 
     return report
 

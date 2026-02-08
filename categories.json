@@ -1,0 +1,8 @@
+{
+  "Dining": ["grubhub", "the cheesecake factory", "five guys", "dunkin donut", "in n out", "mykonos grill", "habit burger", "heytea", "thaibodia", "baekjeong", "mcdonald's", "starbucks", "chipotle", "uber eats"],
+  "Groceries": ["costco", "raley's", "99 ranch", "safeway", "whole foods", "trader joe's", "target", "walmart"],
+  "Travel": ["uber", "united", "delta", "capital one portal", "lyft", "airbnb", "hotel", "expedia"],
+  "Utilities": ["sail internet", "pge", "comcast", "att", "t-mobile", "verizon", "google *fi"],
+  "Shopping": ["nike", "amazon", "apple", "best buy", "nordstrom", "macys", "goodwill"],
+  "Investment/Donation": ["schwab", "charity", "compassion international"]
+}

@@ -64,11 +64,11 @@ def main():
                 row['cumulative_amount'] = round(running_total, 2)
             
             # Explicitly define headers to ensure they appear in Sheets
-            display_headers = ["Date", "Amount", "Merchant", "Cumulative Amount"]
+            display_headers = ["Date", "Amount", "Merchant", "Category", "Cumulative Amount"]
             values_to_upload.append(display_headers)
             
             # Use original keys to extract values from dicts
-            data_keys = ["date", "amount", "merchant", "cumulative_amount"]
+            data_keys = ["date", "amount", "merchant", "category", "cumulative_amount"]
             for row in rows:
                 values_to_upload.append([row.get(k, '') for k in data_keys])
 
