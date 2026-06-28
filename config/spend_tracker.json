@@ -1,0 +1,17 @@
+{
+  "paths": {
+    "benefits": "config/benefits.json",
+    "category_overrides": "config/category_overrides.json",
+    "gemini_key": "gemini_key.txt",
+    "gemini_usage": "gemini_usage.json",
+    "category_cache": "category_cache.json",
+    "token": "token.json",
+    "credentials": "config/credentials.json",
+    "processed_messages": "processed_messages.txt",
+    "transactions_csv": "transactions.csv",
+    "upload_log": "upload_daemon.log",
+    "upload_err": "upload_daemon.err",
+    "recurring_expenses": "recurring_expenses.json"
+  },
+  "daily_limit": 10
+}

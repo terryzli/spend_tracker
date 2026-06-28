@@ -20,14 +20,14 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-GEMINI_KEY_FILE = "gemini_key.txt"
-GEMINI_USAGE_FILE = "gemini_usage.json"
-DAILY_LIMIT = 10
+def load_config():
+    with open("config/spend_tracker.json", "r") as f:
+        return json.load(f)
 
-def get_gemini_usage_count():
+def get_gemini_usage_count(config):
     today = datetime.now().strftime('%Y-%m-%d')
-    if os.path.exists(GEMINI_USAGE_FILE):
-        with open(GEMINI_USAGE_FILE, 'r') as f:
+    if os.path.exists(config["paths"]["gemini_usage"]):
+        with open(config["paths"]["gemini_usage"], 'r') as f:
             try:
                 data = json.load(f)
                 if data.get("date") == today:
@@ -35,33 +35,33 @@ def get_gemini_usage_count():
             except: pass
     return 0
 
-def increment_gemini_usage():
+def increment_gemini_usage(config):
     today = datetime.now().strftime('%Y-%m-%d')
-    count = get_gemini_usage_count() + 1
-    with open(GEMINI_USAGE_FILE, 'w') as f:
+    count = get_gemini_usage_count(config) + 1
+    with open(config["paths"]["gemini_usage"], 'w') as f:
         json.dump({"date": today, "count": count}, f)
 
-def load_category_cache():
-    path = "category_cache.json"
+def load_category_cache(config):
+    path = config["paths"]["category_cache"]
     if os.path.exists(path):
         with open(path, "r") as f:
             try: return json.load(f)
             except: return {}
     return {}
 
-def save_category_cache(cache):
-    with open("category_cache.json", "w") as f:
+def save_category_cache(config, cache):
+    with open(config["paths"]["category_cache"], "w") as f:
         json.dump(cache, f, indent=2)
 
-def load_category_overrides():
-    path = "category_overrides.json"
+def load_category_overrides(config):
+    path = config["paths"]["category_overrides"]
     if os.path.exists(path):
         with open(path, "r") as f:
             try: return json.load(f)
             except: return {}
     return {}
 
-def get_batch_ai_categories(merchants, cache, overrides):
+def get_batch_ai_categories(config, merchants, cache, overrides):
     """Categorizes multiple merchants in one Gemini call."""
     results = {}
     to_ask = []
@@ -77,24 +77,24 @@ def get_batch_ai_categories(merchants, cache, overrides):
             if merchant in cache: results[merchant] = cache[merchant]
             else: to_ask.append(merchant)
     if not to_ask: return results
-    usage = get_gemini_usage_count()
-    if usage >= DAILY_LIMIT:
+    usage = get_gemini_usage_count(config)
+    if usage >= config["daily_limit"]:
         for m in to_ask: results[m] = "Other"
         return results
-    if not os.path.exists(GEMINI_KEY_FILE): return results
-    with open(GEMINI_KEY_FILE, 'r') as f: api_key = f.read().strip()
+    if not os.path.exists(config["paths"]["gemini_key"]): return results
+    with open(config["paths"]["gemini_key"], 'r') as f: api_key = f.read().strip()
     try:
         client = genai.Client(api_key=api_key)
         merchant_list = "\n".join([f"- {m}" for m in to_ask])
         prompt = f"Categorize these merchants into a short 1-2 word category (e.g., Dining, Groceries, Travel, Utilities, Shopping, Gym, Investment). Return ONLY a JSON object.\nMerchants:\n{merchant_list}"
         response = client.models.generate_content(model='gemini-2.5-flash-lite', contents=prompt, config=types.GenerateContentConfig(response_mime_type='application/json'))
-        increment_gemini_usage()
+        increment_gemini_usage(config)
         if response.text:
             batch_results = json.loads(response.text.strip())
             for m, cat in batch_results.items():
                 results[m] = cat
                 cache[m] = cat
-            save_category_cache(cache)
+            save_category_cache(config, cache)
     except:
         for m in to_ask: results[m] = "Other"
     return results
@@ -108,18 +108,18 @@ def process_transaction_rules(transaction):
             transaction['amount'] = "160.00"
     return transaction
 
-def parse_with_gemini(body):
-    if not os.path.exists(GEMINI_KEY_FILE): return None
-    usage = get_gemini_usage_count()
-    if usage >= DAILY_LIMIT: return None
-    with open(GEMINI_KEY_FILE, 'r') as f: api_key = f.read().strip()
+def parse_with_gemini(config, body):
+    if not os.path.exists(config["paths"]["gemini_key"]): return None
+    usage = get_gemini_usage_count(config)
+    if usage >= config["daily_limit"]: return None
+    with open(config["paths"]["gemini_key"], 'r') as f: api_key = f.read().strip()
     try:
         client = genai.Client(api_key=api_key)
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
         clean_text = ' '.join(soup_text.split())[:3000] 
         prompt = f"Extract transaction details. Return ONLY a JSON object with keys: 'amount' (string), 'merchant' (string), 'date' (YYYY-MM-DD). Email: {clean_text}"
         response = client.models.generate_content(model='gemini-2.5-flash-lite', contents=prompt, config=types.GenerateContentConfig(response_mime_type='application/json'))
-        increment_gemini_usage()
+        increment_gemini_usage(config)
         if response.text:
             data = json.loads(response.text.strip())
             if data and all(k in data for k in ['amount', 'merchant', 'date']):
@@ -128,7 +128,7 @@ def parse_with_gemini(body):
     except: pass
     return None
 
-def parse_email_body(body):
+def parse_email_body(config, body):
     try:
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
         match = re.search(r"charged\s+\$(?P<amount>[\d.]+)\s+at\s+(?P<merchant>[^.]+)\.", soup_text, re.DOTALL)
@@ -142,15 +142,15 @@ def parse_email_body(body):
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
         cap_match = re.search(r"at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", soup_text, re.IGNORECASE)
         if cap_match: return {"amount": cap_match.group('amount').replace(',', ''), "merchant": cap_match.group('merchant').strip()}
-    return parse_with_gemini(body)
+    return parse_with_gemini(config, body)
 
 def get_email_date(headers):
     for h in headers:
         if h["name"] == "Date": return h["value"]
     return ""
 
-def load_benefits():
-    with open("benefits.json", "r") as f: return json.load(f)
+def load_benefits(config):
+    with open(config["paths"]["benefits"], "r") as f: return json.load(f)
 
 def check_benefits(transaction, benefits):
     for card, card_benefits in benefits.items():
@@ -160,34 +160,74 @@ def check_benefits(transaction, benefits):
                     print(f"  -> Found transaction for '{benefit}' credit on your {card} card.")
                     return
 
-def load_processed_messages():
-    if os.path.exists("processed_messages.txt"):
-        with open("processed_messages.txt", "r") as f: return set(f.read().splitlines())
+def load_processed_messages(config):
+    if os.path.exists(config["paths"]["processed_messages"]):
+        with open(config["paths"]["processed_messages"], "r") as f: return set(f.read().splitlines())
     return set()
 
-def save_processed_messages(processed_ids):
-    with open("processed_messages.txt", "w") as f:
+def save_processed_messages(config, processed_ids):
+    with open(config["paths"]["processed_messages"], "w") as f:
         for msg_id in processed_ids: f.write(f"{msg_id}\n")
 
+def process_recurring_expenses(config, processed_ids, benefits):
+    """Checks for recurring expenses that should be logged today."""
+    path = config["paths"].get("recurring_expenses", "recurring_expenses.json")
+    if not os.path.exists(path):
+        return []
+
+    try:
+        with open(path, "r") as f:
+            recurring = json.load(f)
+    except Exception as e:
+        print(f"Error loading recurring expenses: {e}")
+        return []
+
+    now = datetime.now()
+    to_log = []
+
+    for item in recurring:
+        # Check if today is >= scheduled day and we haven't logged it for this MONTH/YEAR yet.
+        pseudo_id = f"{item['id_prefix']}_{now.strftime('%Y_%m')}"
+        
+        if now.day >= item['day'] and pseudo_id not in processed_ids:
+            transaction = {
+                "date": now.strftime("%Y-%m-%d"), # Log it as today
+                "amount": str(item['amount']),
+                "merchant": item['name'],
+                "msg_id": pseudo_id
+            }
+            to_log.append(transaction)
+            print(f"  -> Logged recurring transaction: {item['name']} (${item['amount']})")
+
+    return to_log
+
 def main():
+    config = load_config()
     creds = None
-    if os.path.exists("token.json"): creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if os.path.exists(config["paths"]["token"]): creds = Credentials.from_authorized_user_file(config["paths"]["token"], SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token: creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token: token.write(creds.to_json())
+            flow = InstalledAppFlow.from_client_secrets_file(config["paths"]["credentials"], SCOPES)
+            creds = flow.run_local_server(port=8080)
+        with open(config["paths"]["token"], "w") as token: token.write(creds.to_json())
 
     service = build("gmail", "v1", credentials=creds)
-    benefits = load_benefits()
-    cache = load_category_cache()
-    overrides = load_category_overrides()
-    processed_message_ids = load_processed_messages()
+    benefits = load_benefits(config)
+    cache = load_category_cache(config)
+    overrides = load_category_overrides(config)
+    processed_message_ids = load_processed_messages(config)
     new_found = False
 
     try:
         temp_list = []
+
+        # --- Handle Recurring Expenses ---
+        recurring_to_log = process_recurring_expenses(config, processed_message_ids, benefits)
+        for transaction in recurring_to_log:
+            temp_list.append(transaction)
+            new_found = True
+
         query = '\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\" OR \"Credit card transaction exceeds alert limit you set\" OR \"Fwd: Large Purchase Approved\" OR \"Fwd: Your U.S. Bank credit card has a new transaction\" OR \"A new transaction was charged to your account\"'
         results = service.users().messages().list(userId="me", q=query).execute()
         messages = results.get("messages", [])
@@ -201,7 +241,7 @@ def main():
                     if part["mimeType"] == "text/html" and part["body"].get("data"):
                         body = base64.urlsafe_b64decode(part["body"].get("data")).decode("utf-8")
                         break
-            transaction = parse_email_body(body)
+            transaction = parse_email_body(config, body)
             if transaction:
                 transaction = process_transaction_rules(transaction)
                 if "date" not in transaction:
@@ -216,8 +256,8 @@ def main():
                 new_found = True
 
         if temp_list:
-            file_exists = os.path.exists("transactions.csv")
-            with open("transactions.csv", "a", newline="") as csvfile:
+            file_exists = os.path.exists(config["paths"]["transactions_csv"])
+            with open(config["paths"]["transactions_csv"], "a", newline="") as csvfile:
                 fieldnames = ["date", "amount", "merchant", "category", "cumulative_amount"]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 if not file_exists: writer.writeheader()
@@ -226,15 +266,15 @@ def main():
                     writer.writerow(t)
                     processed_message_ids.add(msg_id)
 
-        if os.path.exists("transactions.csv"):
+        if os.path.exists(config["paths"]["transactions_csv"]):
             all_rows = []
-            with open("transactions.csv", "r", newline="") as csvfile:
+            with open(config["paths"]["transactions_csv"], "r", newline="") as csvfile:
                 reader = csv.DictReader(csvfile)
                 all_rows = list(reader)
             if all_rows:
                 # Apply rules and categorize history
                 merchants_to_cat = list(set(r['merchant'] for r in all_rows if not r.get('category') or r['category'] in ['Other', '']))
-                batch_cats = get_batch_ai_categories(merchants_to_cat, cache, overrides)
+                batch_cats = get_batch_ai_categories(config, merchants_to_cat, cache, overrides)
                 unique_rows = []
                 seen = set()
                 for row in all_rows:
@@ -251,7 +291,7 @@ def main():
                     total += float(row['amount'])
                     row['cumulative_amount'] = round(total, 2)
                     check_benefits(row, benefits)
-                with open("transactions.csv", "w", newline="") as csvfile:
+                with open(config["paths"]["transactions_csv"], "w", newline="") as csvfile:
                     fieldnames = ["date", "amount", "merchant", "category", "cumulative_amount"]
                     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                     writer.writeheader()
@@ -260,7 +300,7 @@ def main():
     except HttpError as e: print(f"Error: {e}")
     finally:
         if new_found: 
-            save_processed_messages(processed_message_ids)
+            save_processed_messages(config, processed_message_ids)
             print("Updates complete.")
 
 if __name__ == "__main__":
