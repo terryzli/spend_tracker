@@ -276,9 +276,28 @@ def main():
             temp_list.append(transaction)
             new_found = True
 
-        query = '\"Large Purchase Approved\" OR \"Transaction Alert\" OR \"Your U.S. Bank credit card has a new transaction\" OR \"Credit card transaction exceeds alert limit you set\" OR \"Fwd: Large Purchase Approved\" OR \"Fwd: Your U.S. Bank credit card has a new transaction\" OR \"A new transaction was charged to your account\"'
-        results = service.users().messages().list(userId="me", q=query).execute()
-        messages = results.get("messages", [])
+        query = (
+            'subject:("Large Purchase Approved" OR "Transaction Alert" OR '
+            '"Your U.S. Bank credit card has a new transaction" OR '
+            '"Credit card transaction exceeds alert limit you set" OR '
+            '"A new transaction was charged to your account" OR '
+            '"New transaction charged" OR "Your Single Transaction Alert" OR '
+            '"transaction alert" OR "charged to your card" OR "charged to your account")'
+        )
+        
+        messages = []
+        next_page_token = None
+        while True:
+            results = service.users().messages().list(
+                userId="me", 
+                q=query, 
+                pageToken=next_page_token
+            ).execute()
+            messages.extend(results.get("messages", []))
+            next_page_token = results.get("nextPageToken")
+            if not next_page_token:
+                break
+
         for message in messages:
             if message["id"] in processed_message_ids: continue
             msg = service.users().messages().get(userId="me", id=message["id"], format="full").execute()
