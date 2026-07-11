@@ -6,15 +6,15 @@
     <string>com.user.gmailspendingtracker</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/terrenceli/gmail_spending_tracker/run.sh</string>
+        <string>/Users/trebecca/Desktop/spend_tracker/scripts/run.sh</string>
     </array>
     <key>StartInterval</key>
     <integer>3600</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/terrenceli/gmail_spending_tracker/spending_tracker.log</string>
+    <string>/Users/trebecca/Desktop/spend_tracker/spending_tracker.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/terrenceli/gmail_spending_tracker/spending_tracker.err</string>
+    <string>/Users/trebecca/Desktop/spend_tracker/spending_tracker.err</string>
 </dict>
 </plist>

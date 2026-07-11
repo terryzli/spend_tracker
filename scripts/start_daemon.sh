@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Navigate to the script's directory
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 # Loop to run the script periodically
 while true; do
