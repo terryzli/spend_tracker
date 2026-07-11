@@ -61,6 +61,22 @@ def load_category_overrides(config):
             except: return {}
     return {}
 
+def clean_merchant_name(name):
+    """Cleans up common formatting patterns in merchant names (e.g. 'on [date] at [merchant]')."""
+    if " at " in name:
+        name = name.split(" at ")[-1]
+    name = name.strip(" '\".,")
+    return name
+
+def load_categories(config):
+    """Loads configured categories from categories.json."""
+    path = config["paths"].get("categories", "config/categories.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            try: return json.load(f)
+            except: return {}
+    return {}
+
 def get_batch_ai_categories(config, merchants, cache, overrides):
     """Categorizes multiple merchants in one Gemini call."""
     results = {}
@@ -86,7 +102,9 @@ def get_batch_ai_categories(config, merchants, cache, overrides):
     try:
         client = genai.Client(api_key=api_key)
         merchant_list = "\n".join([f"- {m}" for m in to_ask])
-        prompt = f"Categorize these merchants into a short 1-2 word category (e.g., Dining, Groceries, Travel, Utilities, Shopping, Gym, Investment). Return ONLY a JSON object.\nMerchants:\n{merchant_list}"
+        categories = load_categories(config)
+        categories_str = ", ".join(list(categories.keys()) + ["Other"])
+        prompt = f"Categorize these merchants into one of these exact categories: {categories_str}. Return ONLY a JSON object mapping each merchant to its category.\nMerchants:\n{merchant_list}"
         response = client.models.generate_content(model='gemini-2.5-flash-lite', contents=prompt, config=types.GenerateContentConfig(response_mime_type='application/json'))
         increment_gemini_usage(config)
         if response.text:
@@ -116,33 +134,63 @@ def parse_with_gemini(config, body):
     try:
         client = genai.Client(api_key=api_key)
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
-        clean_text = ' '.join(soup_text.split())[:3000] 
-        prompt = f"Extract transaction details. Return ONLY a JSON object with keys: 'amount' (string), 'merchant' (string), 'date' (YYYY-MM-DD). Email: {clean_text}"
-        response = client.models.generate_content(model='gemini-2.5-flash-lite', contents=prompt, config=types.GenerateContentConfig(response_mime_type='application/json'))
+        clean_text = ' '.join(soup_text.split())[:4000] 
+        
+        categories = load_categories(config)
+        categories_str = ", ".join(list(categories.keys()) + ["Other"])
+        
+        prompt = (
+            f"Analyze the following email from a credit card company or bank. "
+            f"Extract the transaction details and return ONLY a JSON object with these keys:\n"
+            f"- 'amount': the transaction amount (string, e.g., '230.42')\n"
+            f"- 'merchant': the clean, friendly name of the merchant (string, e.g., 'Walmart' instead of 'on May. 14, 2026, at Walmart', 'Lowe's' instead of 'on May. 16, 2026, at Lowe's', 'Google' instead of 'Google *fi')\n"
+            f"- 'date': the date of the transaction in YYYY-MM-DD format (extract from email context)\n"
+            f"- 'category': classify the transaction into one of these exact categories: {categories_str}. Choose 'Other' if it doesn't fit any.\n\n"
+            f"Email body:\n{clean_text}"
+        )
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash-lite',
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type='application/json')
+        )
         increment_gemini_usage(config)
         if response.text:
             data = json.loads(response.text.strip())
             if data and all(k in data for k in ['amount', 'merchant', 'date']):
                 data['amount'] = str(data['amount']).replace('$', '').replace(',', '')
+                data['merchant'] = clean_merchant_name(data['merchant'])
                 return data
-    except: pass
+    except Exception as e:
+        print(f"Gemini parsing failed: {e}")
     return None
 
 def parse_email_body(config, body):
+    # 1. Try Gemini first to get a complete, high-quality parse of the entire email
+    gemini_res = parse_with_gemini(config, body)
+    if gemini_res:
+        return gemini_res
+
+    # 2. Fall back to regex parsing if Gemini is unavailable or fails
     try:
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
         match = re.search(r"charged\s+\$(?P<amount>[\d.]+)\s+at\s+(?P<merchant>[^.]+)\.", soup_text, re.DOTALL)
         if not match: match = re.search(r"Amount:\s+\$(?P<amount>[\d.]+).*?Merchant:\s+(?P<merchant>[^.\n]+)", soup_text, re.DOTALL | re.IGNORECASE)
         if match:
             res = match.groupdict()
-            res['merchant'] = ' '.join(res['merchant'].split())
+            res['merchant'] = clean_merchant_name(' '.join(res['merchant'].split()))
             return res
     except: pass
+    
     if "capitalone.com" in body:
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
         cap_match = re.search(r"at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", soup_text, re.IGNORECASE)
-        if cap_match: return {"amount": cap_match.group('amount').replace(',', ''), "merchant": cap_match.group('merchant').strip()}
-    return parse_with_gemini(config, body)
+        if cap_match: 
+            return {
+                "amount": cap_match.group('amount').replace(',', ''), 
+                "merchant": clean_merchant_name(cap_match.group('merchant').strip())
+            }
+    return None
 
 def get_email_date(headers):
     for h in headers:
@@ -244,6 +292,7 @@ def main():
             transaction = parse_email_body(config, body)
             if transaction:
                 transaction = process_transaction_rules(transaction)
+                transaction['merchant'] = clean_merchant_name(transaction['merchant'])
                 if "date" not in transaction:
                     try:
                         raw_date = get_email_date(payload["headers"])
@@ -272,13 +321,17 @@ def main():
                 reader = csv.DictReader(csvfile)
                 all_rows = list(reader)
             if all_rows:
-                # Apply rules and categorize history
+                # Clean up all merchant names in the history first
+                for row in all_rows:
+                    row['merchant'] = clean_merchant_name(row['merchant'])
+                    row = process_transaction_rules(row)
+
+                # Now get the unique set of merchants that need categorization
                 merchants_to_cat = list(set(r['merchant'] for r in all_rows if not r.get('category') or r['category'] in ['Other', '']))
                 batch_cats = get_batch_ai_categories(config, merchants_to_cat, cache, overrides)
                 unique_rows = []
                 seen = set()
                 for row in all_rows:
-                    row = process_transaction_rules(row)
                     row_key = (row['date'], row['amount'], row['merchant'])
                     if row_key not in seen:
                         if not row.get('category') or row['category'] in ['Other', '']:

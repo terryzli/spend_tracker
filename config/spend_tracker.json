@@ -11,7 +11,8 @@
     "transactions_csv": "transactions.csv",
     "upload_log": "upload_daemon.log",
     "upload_err": "upload_daemon.err",
-    "recurring_expenses": "recurring_expenses.json"
+    "recurring_expenses": "recurring_expenses.json",
+    "categories": "config/categories.json"
   },
-  "daily_limit": 10
+  "daily_limit": 500
 }
