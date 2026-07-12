@@ -5,8 +5,19 @@ import csv
 from datetime import datetime
 import os
 
-# Get the directory of the current script to locate data files
+# Get the directory of the current script and the root project directory
 script_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(script_dir)
+
+def load_config():
+    config_path = os.path.join(root_dir, "config/spend_tracker.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
 
 def get_biannual_period(date_obj):
     """Returns the biannual period (1 for Jan-Jun, 2 for Jul-Dec) for a given date."""
@@ -19,15 +30,20 @@ def calculate_spending():
     """
     Calculates total spending and benefit progress on the fly from the transactions log.
     """
-    benefits_path = os.path.join(script_dir, 'benefits.json')
-    transactions_path = os.path.join(script_dir, 'transactions.csv')
+    config = load_config()
+    
+    benefits_rel = config.get("paths", {}).get("benefits", "config/benefits.json")
+    benefits_path = os.path.join(root_dir, benefits_rel)
+    
+    transactions_rel = config.get("paths", {}).get("transactions_csv", "transactions.csv")
+    transactions_path = os.path.join(root_dir, transactions_rel)
 
     # Load benefit rules
     with open(benefits_path, 'r') as f:
         benefits_config = json.load(f)
     
     # Load manual adjustments
-    manual_path = os.path.join(script_dir, 'manual_credits.json')
+    manual_path = os.path.join(root_dir, 'config/manual_credits.json')
     manual_adjustments = {}
     if os.path.exists(manual_path):
         try:
