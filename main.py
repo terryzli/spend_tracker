@@ -166,31 +166,47 @@ def parse_with_gemini(config, body):
     return None
 
 def parse_email_body(config, body):
-    # 1. Try Gemini first to get a complete, high-quality parse of the entire email
-    gemini_res = parse_with_gemini(config, body)
-    if gemini_res:
-        return gemini_res
-
-    # 2. Fall back to regex parsing if Gemini is unavailable or fails
+    # 1. Try regex parsing first (fast, free, and no rate limits)
     try:
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
-        match = re.search(r"charged\s+\$(?P<amount>[\d.]+)\s+at\s+(?P<merchant>[^.]+)\.", soup_text, re.DOTALL)
-        if not match: match = re.search(r"Amount:\s+\$(?P<amount>[\d.]+).*?Merchant:\s+(?P<merchant>[^.\n]+)", soup_text, re.DOTALL | re.IGNORECASE)
+        clean_soup_text = ' '.join(soup_text.split())
+        
+        # Pattern A: "Amount: $X ... Where: Y" (Bank of America format)
+        match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+).*?Where:\s+(?P<merchant>[^.\n]+?)(?:\s+View|\s+Date|\.)", clean_soup_text, re.IGNORECASE)
+
+        # Pattern B: Amex Large Purchase format ("Merchant $Amount* Day, Month Date, Year")
+        if not match:
+            match = re.search(r"(?P<merchant>[A-Za-z0-9\s#&-]{2,30}?)\s+\$(?P<amount>[\d,.]+)\*\s+[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d", clean_soup_text, re.IGNORECASE)
+
+        # Pattern C: "Amount: $X ... Merchant: Y" (Amex/forwarded formats)
+        if not match:
+            match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+).*?Merchant:\s+(?P<merchant>[^.\n]+)", clean_soup_text, re.DOTALL | re.IGNORECASE)
+            
+        # Pattern D: "at Y, a pending ... amount of $X" (Capital One)
+        if not match:
+            match = re.search(r"at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", clean_soup_text, re.IGNORECASE)
+
+        # Pattern E: Generic Fallback (Matches "$10.00 at Starbucks", "charged $88.18 at Lowe's")
+        if not match:
+            match = re.search(r"\$(?P<amount>[\d,.]+)\s+at\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+            
+        if not match:
+            match = re.search(r"\$(?P<amount>[\d,.]+).*?at\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+
         if match:
             res = match.groupdict()
+            res['amount'] = res['amount'].replace(',', '')
             res['merchant'] = clean_merchant_name(' '.join(res['merchant'].split()))
             return res
-    except: pass
-    
-    if "capitalone.com" in body:
-        soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
-        cap_match = re.search(r"at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", soup_text, re.IGNORECASE)
-        if cap_match: 
-            return {
-                "amount": cap_match.group('amount').replace(',', ''), 
-                "merchant": clean_merchant_name(cap_match.group('merchant').strip())
-            }
-    return None
+    except Exception as e:
+        print(f"Regex parsing failed: {e}")
+        pass
+
+    # 2. Fall back to Gemini only if regex fails
+    # Since the free tier is limited to 15 Requests Per Minute (RPM), we introduce a 4.1s delay
+    import time
+    time.sleep(4.1)
+    return parse_with_gemini(config, body)
 
 def get_email_date(headers):
     for h in headers:
@@ -276,14 +292,27 @@ def main():
             temp_list.append(transaction)
             new_found = True
 
+        after_date_str = ""
+        csv_path = config["paths"]["transactions_csv"]
+        if os.path.exists(csv_path):
+            with open(csv_path, "r", newline="") as csvfile:
+                reader = csv.DictReader(csvfile)
+                dates = [r["date"] for r in reader if r.get("date")]
+                if dates:
+                    try:
+                        latest_date = max(datetime.strptime(d, "%Y-%m-%d") for d in dates)
+                        after_date_str = f" after:{latest_date.strftime('%Y-%m-%d')}"
+                    except Exception as e:
+                        print(f"Failed to parse dates from CSV: {e}")
+
         query = (
-            'subject:("Large Purchase Approved" OR "Transaction Alert" OR '
-            '"Your U.S. Bank credit card has a new transaction" OR '
-            '"Credit card transaction exceeds alert limit you set" OR '
-            '"A new transaction was charged to your account" OR '
-            '"New transaction charged" OR "Your Single Transaction Alert" OR '
-            '"transaction alert" OR "charged to your card" OR "charged to your account")'
+            '("Large Purchase" OR "Transaction Alert" OR "new transaction" OR '
+            '"exceeds alert" OR "transaction was charged" OR "transaction charged" OR '
+            '"Single Transaction Alert" OR "charged to your card" OR "charged to your account")'
         )
+        if after_date_str:
+            query += after_date_str
+            print(f"Restricting search query with date: {after_date_str}")
         
         messages = []
         next_page_token = None
@@ -302,12 +331,26 @@ def main():
             if message["id"] in processed_message_ids: continue
             msg = service.users().messages().get(userId="me", id=message["id"], format="full").execute()
             payload = msg["payload"]
-            body = ""
-            if "parts" in payload:
-                for part in payload["parts"]:
-                    if part["mimeType"] == "text/html" and part["body"].get("data"):
-                        body = base64.urlsafe_b64decode(part["body"].get("data")).decode("utf-8")
-                        break
+            
+            subject = ""
+            for h in payload.get("headers", []):
+                if h["name"] == "Subject":
+                    subject = h["value"]
+                    break
+            print(f"DEBUG: Processing email with subject: '{subject}' (ID: {message['id']})")
+            
+            def get_html_body(p):
+                if p.get("mimeType") == "text/html" and p.get("body", {}).get("data"):
+                    return base64.urlsafe_b64decode(p["body"]["data"]).decode("utf-8")
+                if "parts" in p:
+                    for part in p["parts"]:
+                        b = get_html_body(part)
+                        if b: return b
+                return ""
+            
+            body = get_html_body(payload)
+            if not body and "body" in payload and payload["body"].get("data"):
+                body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
             transaction = parse_email_body(config, body)
             if transaction:
                 transaction = process_transaction_rules(transaction)
