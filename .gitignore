@@ -3,6 +3,7 @@ token.json
 credentials.json
 processed_messages.txt
 transactions.csv
+transactions_cleaned.csv
 last_upload_date.txt
 *.log
 *.err

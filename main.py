@@ -3,11 +3,14 @@ import base64
 import re
 import csv
 import json
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -165,7 +168,7 @@ def parse_with_gemini(config, body):
         print(f"Gemini parsing failed: {e}")
     return None
 
-def parse_email_body(config, body):
+def parse_email_body(config, body, subject=""):
     # 1. Try regex parsing first (fast, free, and no rate limits)
     try:
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
@@ -186,12 +189,22 @@ def parse_email_body(config, body):
         if not match:
             match = re.search(r"at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", clean_soup_text, re.IGNORECASE)
 
-        # Pattern E: Generic Fallback (Matches "$10.00 at Starbucks", "charged $88.18 at Lowe's")
+        # Pattern D2: U.S. Bank format ("You made a $X transaction with Y")
         if not match:
-            match = re.search(r"\$(?P<amount>[\d,.]+)\s+at\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+            match = re.search(r"(?:made a\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+
+        # Pattern E: Generic Fallback (Matches "$10.00 at Starbucks", "charged $88.18 at Lowe's", "$10 with Uber")
+        if not match:
+            match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
             
         if not match:
-            match = re.search(r"\$(?P<amount>[\d,.]+).*?at\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+            match = re.search(r"\$(?P<amount>[\d,.]+).*?(?:at|with)\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+
+        # Pattern F: Check subject line (e.g. U.S. Bank "You made a $X transaction with Y")
+        if not match and subject:
+            match = re.search(r"(?:made a\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", subject, re.IGNORECASE)
+            if not match:
+                match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>.+)", subject, re.IGNORECASE)
 
         if match:
             res = match.groupdict()
@@ -270,8 +283,12 @@ def main():
     creds = None
     if os.path.exists(config["paths"]["token"]): creds = Credentials.from_authorized_user_file(config["paths"]["token"], SCOPES)
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token: creds.refresh(Request())
-        else:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                creds = None
+        if not creds:
             flow = InstalledAppFlow.from_client_secrets_file(config["paths"]["credentials"], SCOPES)
             creds = flow.run_local_server(port=8080)
         with open(config["paths"]["token"], "w") as token: token.write(creds.to_json())
@@ -294,14 +311,31 @@ def main():
 
         after_date_str = ""
         csv_path = config["paths"]["transactions_csv"]
-        if os.path.exists(csv_path):
+
+        if "--all" in sys.argv or "--full" in sys.argv:
+            after_date_str = ""
+            print("Full search requested: searching without date restriction.")
+        elif any(arg.startswith("--since=") for arg in sys.argv):
+            for arg in sys.argv:
+                if arg.startswith("--since="):
+                    since_val = arg.split("=", 1)[1]
+                    after_date_str = f" after:{since_val}"
+                    print(f"Custom since date requested: {after_date_str}")
+        elif "--backfill" in sys.argv:
+            after_date_str = " after:2026-07-10"
+            print(f"Backfill requested: restricting search to emails after 2026-07-10")
+        elif os.path.exists(csv_path):
             with open(csv_path, "r", newline="") as csvfile:
                 reader = csv.DictReader(csvfile)
                 dates = [r["date"] for r in reader if r.get("date")]
                 if dates:
                     try:
                         latest_date = max(datetime.strptime(d, "%Y-%m-%d") for d in dates)
-                        after_date_str = f" after:{latest_date.strftime('%Y-%m-%d')}"
+                        # Use a 2-day lookback buffer before latest_date so that all transactions
+                        # on the latest date (and timezone overlaps) are always included in Gmail search.
+                        # Already-processed transactions are skipped via processed_messages.txt.
+                        search_date = latest_date - timedelta(days=2)
+                        after_date_str = f" after:{search_date.strftime('%Y-%m-%d')}"
                     except Exception as e:
                         print(f"Failed to parse dates from CSV: {e}")
 
@@ -351,17 +385,22 @@ def main():
             body = get_html_body(payload)
             if not body and "body" in payload and payload["body"].get("data"):
                 body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
-            transaction = parse_email_body(config, body)
+            transaction = parse_email_body(config, body, subject=subject)
             if transaction:
                 transaction = process_transaction_rules(transaction)
                 transaction['merchant'] = clean_merchant_name(transaction['merchant'])
                 if "date" not in transaction:
                     try:
                         raw_date = get_email_date(payload["headers"])
-                        clean_date = re.sub(r'\s*\([^)]*\)', '', raw_date).strip()
-                        date_obj = datetime.strptime(clean_date, '%a, %d %b %Y %H:%M:%S %z')
+                        date_obj = parsedate_to_datetime(raw_date)
                         transaction["date"] = date_obj.strftime('%Y-%m-%d')
-                    except: transaction["date"] = datetime.now().strftime('%Y-%m-%d')
+                    except Exception:
+                        try:
+                            clean_date = re.sub(r'\s*\([^)]*\)', '', raw_date).strip()
+                            date_obj = datetime.strptime(clean_date, '%a, %d %b %Y %H:%M:%S %z')
+                            transaction["date"] = date_obj.strftime('%Y-%m-%d')
+                        except Exception:
+                            transaction["date"] = datetime.now().strftime('%Y-%m-%d')
                 transaction['msg_id'] = message["id"]
                 temp_list.append(transaction)
                 new_found = True
