@@ -80,6 +80,20 @@ def main():
             print("No transaction data to upload.")
             return
 
+        # --- Safety Check: Prevent clobbering sheet with stale data ---
+        import sys
+        if "--force" not in sys.argv:
+            try:
+                existing_res = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range="Transactions!A:A").execute()
+                existing_rows = existing_res.get("values", [])
+                if existing_rows and len(existing_rows) > len(values_to_upload):
+                    print(f"ABORTED: Google Sheet currently has {len(existing_rows)} rows, but local CSV only has {len(values_to_upload)} rows.")
+                    print("Aborting upload to prevent clobbering Google Sheet with stale data.")
+                    print("To force upload anyway, pass --force.")
+                    return
+            except Exception as e:
+                print(f"Warning: Could not check existing sheet length ({e}), proceeding with upload.")
+
         # --- Clear the existing sheet data ---
         print("Clearing existing data from Transactions sheet...")
         sheet.values().clear(
