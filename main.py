@@ -193,6 +193,10 @@ def parse_email_body(config, body, subject=""):
         if not match:
             match = re.search(r"(?:made a\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
 
+        # Pattern D3: Citi format ("Amount: $X ... Merchant Y Date")
+        if not match:
+            match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+).*?Merchant\s+(?P<merchant>[^.\n]+?)\s+Date", clean_soup_text, re.IGNORECASE)
+
         # Pattern E: Generic Fallback (Matches "$10.00 at Starbucks", "charged $88.18 at Lowe's", "$10 with Uber")
         if not match:
             match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
@@ -202,7 +206,7 @@ def parse_email_body(config, body, subject=""):
 
         # Pattern F: Check subject line (e.g. U.S. Bank "You made a $X transaction with Y")
         if not match and subject:
-            match = re.search(r"(?:made a\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", subject, re.IGNORECASE)
+            match = re.search(r"(?:made a\s+|A\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", subject, re.IGNORECASE)
             if not match:
                 match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>.+)", subject, re.IGNORECASE)
 
@@ -342,7 +346,8 @@ def main():
         query = (
             '("Large Purchase" OR "Transaction Alert" OR "new transaction" OR '
             '"exceeds alert" OR "transaction was charged" OR "transaction charged" OR '
-            '"Single Transaction Alert" OR "charged to your card" OR "charged to your account")'
+            '"Single Transaction Alert" OR "charged to your card" OR "charged to your account" OR '
+            '"transaction was made" OR "You made a" OR "transaction with")'
         )
         if after_date_str:
             query += after_date_str
