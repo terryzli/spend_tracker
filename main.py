@@ -66,6 +66,19 @@ def load_category_overrides(config):
 
 def clean_merchant_name(name):
     """Cleans up common formatting patterns in merchant names (e.g. 'on [date] at [merchant]')."""
+    if not name:
+        return ""
+    # Strip Capital One / bank disclaimers
+    if " This may have occurred " in name:
+        name = name.split(" This may have occurred ")[0]
+    # Strip Chase / bank timestamp prefix like "5:33 PM ET Merchant " or "12:28 AM ET Merchant "
+    if " Merchant " in name:
+        name = name.split(" Merchant ")[-1]
+    # Strip trailing " Amount $..."
+    if " Amount " in name:
+        name = name.split(" Amount ")[0]
+    # Strip any leading timestamps e.g. "8:53 PM ET "
+    name = re.sub(r'^(?:\d{1,2}:\d{2}\s*(?:AM|PM)\s*(?:ET|PT|CT|MT)?\s*)', '', name, flags=re.IGNORECASE)
     if " at " in name:
         name = name.split(" at ")[-1]
     name = name.strip(" '\".,")
@@ -169,7 +182,18 @@ def parse_with_gemini(config, body):
     return None
 
 def parse_email_body(config, body, subject=""):
-    # 1. Try regex parsing first (fast, free, and no rate limits)
+    # 0. Check structured subject lines first (Chase & U.S. Bank: "You made a $X transaction with <Merchant>")
+    if subject:
+        subj_match = re.search(r"(?:made a\s+|A\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", subject, re.IGNORECASE)
+        if not subj_match:
+            subj_match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>.+)", subject, re.IGNORECASE)
+        if subj_match:
+            res = subj_match.groupdict()
+            res['amount'] = res['amount'].replace(',', '')
+            res['merchant'] = clean_merchant_name(res['merchant'])
+            return res
+
+    # 1. Try regex parsing on body (fast, free, and no rate limits)
     try:
         soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
         clean_soup_text = ' '.join(soup_text.split())
@@ -189,31 +213,26 @@ def parse_email_body(config, body, subject=""):
         if not match:
             match = re.search(r"at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", clean_soup_text, re.IGNORECASE)
 
-        # Pattern D2: U.S. Bank format ("You made a $X transaction with Y")
+        # Pattern D2: Chase Body format ("Merchant <Merchant> Amount $X")
         if not match:
-            match = re.search(r"(?:made a\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+            match = re.search(r"Merchant\s+(?P<merchant>.+?)\s+Amount\s+\$(?P<amount>[\d,.]+)", clean_soup_text, re.IGNORECASE)
 
         # Pattern D3: Citi format ("Amount: $X ... Merchant Y Date")
         if not match:
             match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+).*?Merchant\s+(?P<merchant>[^.\n]+?)\s+Date", clean_soup_text, re.IGNORECASE)
 
-        # Pattern E: Generic Fallback (Matches "$10.00 at Starbucks", "charged $88.18 at Lowe's", "$10 with Uber")
+        # Pattern D4: U.S. Bank Body format ("You made a $X transaction with Y")
         if not match:
-            match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
-            
-        if not match:
-            match = re.search(r"\$(?P<amount>[\d,.]+).*?(?:at|with)\s+(?P<merchant>[^.]{2,40}?)(?:\s+on|\.|\s+at|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
+            match = re.search(r"(?:made a\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
 
-        # Pattern F: Check subject line (e.g. U.S. Bank "You made a $X transaction with Y")
-        if not match and subject:
-            match = re.search(r"(?:made a\s+|A\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", subject, re.IGNORECASE)
-            if not match:
-                match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>.+)", subject, re.IGNORECASE)
+        # Pattern E: Generic Fallback (Matches "$10.00 at Starbucks", "charged $88.18 at Lowe's")
+        if not match:
+            match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>[^.\n]{2,40}?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", clean_soup_text, re.IGNORECASE)
 
         if match:
             res = match.groupdict()
             res['amount'] = res['amount'].replace(',', '')
-            res['merchant'] = clean_merchant_name(' '.join(res['merchant'].split()))
+            res['merchant'] = clean_merchant_name(res['merchant'])
             return res
     except Exception as e:
         print(f"Regex parsing failed: {e}")
