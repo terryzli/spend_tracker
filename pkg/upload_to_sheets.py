@@ -18,11 +18,20 @@ SCOPES = [
 SPREADSHEET_ID = "14upQxkTP0ZI3cfJTKzH0DcFnerBBvSy2RPy6Posgdow"
 RANGE_NAME = "Transactions!A1"  # Start at the top-left of the Transactions sheet
 
+# Get the directory of the current script and the root project directory
+script_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(script_dir)
+
 def get_credentials():
     """Gets valid user credentials from storage or initiates the OAuth flow."""
     creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    token_path = os.path.join(root_dir, "token.json")
+    creds_path = os.path.join(root_dir, "config/credentials.json")
+    if not os.path.exists(creds_path):
+        creds_path = os.path.join(root_dir, "credentials.json")
+
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
@@ -30,27 +39,30 @@ def get_credentials():
             except RefreshError:
                 creds = None
         if not creds:
+            if not os.path.exists(creds_path):
+                raise FileNotFoundError(f"credentials.json not found in {root_dir} or {root_dir}/config")
             flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES
+                creds_path, SCOPES
             )
             creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
+        with open(token_path, "w") as token:
             token.write(creds.to_json())
     return creds
 
 def main():
     """Reads transaction data from a CSV and uploads it to a Google Sheet."""
+    # --- Read data from CSV ---
+    transactions_path = os.path.join(root_dir, 'transactions.csv')
+    if not os.path.exists(transactions_path):
+        print(f"transactions.csv not found at {transactions_path}. Nothing to upload.")
+        print("Note: If running on Home Assistant, sync transactions.csv from your development machine (scp), or run 'python main.py' to generate it.")
+        return
+
     creds = get_credentials()
     
     try:
         service = build("sheets", "v4", credentials=creds)
         sheet = service.spreadsheets()
-
-        # --- Read data from CSV ---
-        transactions_path = 'transactions.csv'
-        if not os.path.exists(transactions_path):
-            print("transactions.csv not found. Nothing to upload.")
-            return
 
         values_to_upload = []
         with open(transactions_path, 'r') as f:
