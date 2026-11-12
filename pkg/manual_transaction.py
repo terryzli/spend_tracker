@@ -3,9 +3,13 @@ import os
 import sys
 from datetime import datetime
 
+# Get project directories
+script_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.dirname(script_dir)
+
 # Path to the data files
-MANUAL_CREDITS_PATH = os.path.join(os.path.dirname(__file__), 'manual_credits.json')
-BENEFITS_PATH = os.path.join(os.path.dirname(__file__), 'benefits.json')
+MANUAL_CREDITS_PATH = os.path.join(root_dir, 'config/manual_credits.json')
+BENEFITS_PATH = os.path.join(root_dir, 'config/benefits.json')
 
 def get_period_key(reset_cycle, date_obj):
     """Generates a unique key for the current period based on the reset cycle."""
@@ -21,23 +25,39 @@ def get_period_key(reset_cycle, date_obj):
 def add_manual_spend(amount, benefit_key):
     """Records manual spending for a specific benefit period."""
     if not os.path.exists(BENEFITS_PATH):
-        print("Error: benefits.json not found.")
+        print(f"Error: benefits.json not found at {BENEFITS_PATH}.")
         return
 
     with open(BENEFITS_PATH, 'r') as f:
         benefits_config = json.load(f)
 
-    # Find the card for this benefit key
+    # Support "card:benefit_key" or "card.benefit_key" or "card/benefit_key"
+    specified_card = None
+    for sep in [":", ".", "/"]:
+        if sep in benefit_key:
+            specified_card, benefit_key = benefit_key.split(sep, 1)
+            break
+
     target_card = None
     reset_cycle = 'annual'
-    for card, card_benefits in benefits_config.items():
-        if benefit_key in card_benefits:
-            target_card = card
-            reset_cycle = card_benefits[benefit_key].get('reset_cycle', 'annual')
-            break
+
+    if specified_card and specified_card in benefits_config:
+        if benefit_key in benefits_config[specified_card]:
+            target_card = specified_card
+            reset_cycle = benefits_config[target_card][benefit_key].get('reset_cycle', 'annual')
+        else:
+            print(f"Error: Benefit key '{benefit_key}' not found in card '{specified_card}'.")
+            return
+    else:
+        # Search all cards for this benefit key
+        for card, card_benefits in benefits_config.items():
+            if benefit_key in card_benefits:
+                target_card = card
+                reset_cycle = card_benefits[benefit_key].get('reset_cycle', 'annual')
+                break
     
     if not target_card:
-        print(f"Error: Benefit key '{benefit_key}' not found.")
+        print(f"Error: Benefit key '{benefit_key}' not found in {BENEFITS_PATH}.")
         return
 
     # Load existing manual spend data
