@@ -46,7 +46,7 @@ pip install -r requirements.txt
 ### 1. Synchronizing Data from Development Machine to Home Assistant
 Since `transactions.csv`, `processed_messages.txt`, and credentials are git-ignored, copy your up-to-date data and tokens to Home Assistant once via SSH:
 ```bash
-scp transactions.csv processed_messages.txt category_cache.json token.json credentials.json gemini_key.txt root@<ha-ip>:/config/gmail_spending_tracker/
+scp transactions.csv processed_messages.txt category_cache.json token.json credentials.json gemini_key.txt root@<ha-ip>:/config/spend_tracker/
 ```
 
 ### 2. Daily Automation on Home Assistant (Recommended)
@@ -55,7 +55,7 @@ The cleanest way to run the tracker daily on Home Assistant without keeping back
 1. Add to your `configuration.yaml`:
    ```yaml
    shell_command:
-     run_spending_tracker: "cd /config/gmail_spending_tracker && ./scripts/run.sh"
+     run_spending_tracker: "cd /config/spend_tracker && ./scripts/run.sh"
    ```
 2. Create an automation (in `automations.yaml` or via the Home Assistant UI) to trigger daily (e.g., at 2:00 AM):
    ```yaml
@@ -74,7 +74,7 @@ The cleanest way to run the tracker daily on Home Assistant without keeping back
 If you prefer running a continuous background loop inside the **Advanced SSH & Web Terminal** add-on, configure its `startup_commands` in the add-on settings:
 ```yaml
 startup_commands:
-  - 'cd /config/gmail_spending_tracker && nohup ./scripts/start_daemon.sh 86400 > /dev/null 2>&1 &'
+  - 'cd /config/spend_tracker && nohup ./scripts/start_daemon.sh 86400 > /dev/null 2>&1 &'
 ```
 *(By default, `./scripts/start_daemon.sh` sleeps for 86,400 seconds / 24 hours between runs and executes both `main.py` and `pkg/upload_to_sheets.py` via `scripts/run.sh`)*.
 
@@ -86,7 +86,7 @@ command_line:
   - sensor:
       name: "Spending Tracker"
       unique_id: spending_tracker_report
-      command: "/config/gmail_spending_tracker/venv/bin/python /config/gmail_spending_tracker/pkg/report.py"
+      command: "/config/spend_tracker/venv/bin/python /config/spend_tracker/pkg/report.py"
       value_template: "{{ value_json.monthly_spending }}"
       unit_of_measurement: "USD"
       scan_interval: 3600
