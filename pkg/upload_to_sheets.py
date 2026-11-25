@@ -1,135 +1,183 @@
-import os.path
+#!/usr/bin/env python3
+"""Uploads transaction data from transactions.csv to Google Sheets safely (update before clear)."""
+
+import argparse
 import csv
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+import logging
+import os
+import sys
+from typing import Any, Dict, List, Optional
+
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Combined scopes for Gmail (to reuse existing credentials) and Sheets
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+from pkg.common import (
+    ROOT_DIR,
+    SHEETS_COLUMNS,
+    get_config_path,
+    get_credentials,
+    load_config,
+    setup_logging,
+)
 
-# The ID of your Google Sheet.
-# Replace this with the ID you copied from the URL.
-SPREADSHEET_ID = "14upQxkTP0ZI3cfJTKzH0DcFnerBBvSy2RPy6Posgdow"
-RANGE_NAME = "Transactions!A1"  # Start at the top-left of the Transactions sheet
+logger = logging.getLogger(__name__)
 
-# Get the directory of the current script and the root project directory
-script_dir = os.path.dirname(os.path.abspath(__file__))
-root_dir = os.path.dirname(script_dir)
 
-def get_credentials():
-    """Gets valid user credentials from storage or initiates the OAuth flow."""
-    creds = None
-    token_path = os.path.join(root_dir, "token.json")
-    creds_path = os.path.join(root_dir, "config/credentials.json")
-    if not os.path.exists(creds_path):
-        creds_path = os.path.join(root_dir, "credentials.json")
+def build_sheet_values(transactions_path: str) -> List[List[Any]]:
+    """Reads transactions.csv, sorts chronologically, recomputes cumulative totals, and builds Sheets rows."""
+    with open(transactions_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
 
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                creds = None
-        if not creds:
-            if not os.path.exists(creds_path):
-                raise FileNotFoundError(f"credentials.json not found in {root_dir} or {root_dir}/config")
-            flow = InstalledAppFlow.from_client_secrets_file(
-                creds_path, SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w") as token:
-            token.write(creds.to_json())
-    return creds
+    rows.sort(key=lambda x: x.get("date", ""))
 
-def main():
-    """Reads transaction data from a CSV and uploads it to a Google Sheet."""
-    # --- Read data from CSV ---
-    transactions_path = os.path.join(root_dir, 'transactions.csv')
+    running_total = 0.0
+    for row in rows:
+        try:
+            running_total += float(row["amount"])
+        except (ValueError, KeyError, TypeError):
+            logger.warning("Skipping invalid amount while calculating cumulative total: %s", row)
+        row["cumulative_amount"] = f"{running_total:.2f}"
+
+    display_headers = [header for _, header in SHEETS_COLUMNS]
+    data_keys = [key for key, _ in SHEETS_COLUMNS]
+
+    values: List[List[Any]] = [display_headers]
+    for row in rows:
+        values.append([row.get(k, "") for k in data_keys])
+    return values
+
+
+def upload_transactions(
+    config: Dict[str, Any],
+    service: Any,
+    root_dir: str = ROOT_DIR,
+    force: bool = False,
+    dry_run: bool = False,
+) -> bool:
+    """
+    Uploads transactions.csv to Google Sheets.
+    Updates cells BEFORE clearing any trailing surplus rows so an API failure
+    mid-upload can never leave the sheet blank.
+    """
+    transactions_path = get_config_path(config, "transactions_csv", "transactions.csv", root_dir=root_dir)
     if not os.path.exists(transactions_path):
-        print(f"transactions.csv not found at {transactions_path}. Nothing to upload.")
-        print("Note: If running on Home Assistant, sync transactions.csv from your development machine (scp), or run 'python main.py' to generate it.")
-        return
+        logger.warning(
+            "transactions.csv not found at %s. Nothing to upload. "
+            "Run 'python main.py' or sync transactions.csv first.",
+            transactions_path,
+        )
+        return False
 
-    creds = get_credentials()
-    
+    sheets_cfg = config.get("google_sheets", {})
+    spreadsheet_id = sheets_cfg.get("spreadsheet_id") or os.environ.get("SPREADSHEET_ID", "")
+    sheet_name = sheets_cfg.get("sheet_name", "Transactions")
+    if not spreadsheet_id:
+        logger.error("No Google Sheets spreadsheet_id configured in config/spend_tracker.json.")
+        return False
+
+    values_to_upload = build_sheet_values(transactions_path)
+    if len(values_to_upload) <= 1:
+        logger.info("No transaction data to upload.")
+        return False
+
+    sheet = service.spreadsheets()
+    existing_row_count = 0
+
     try:
-        service = build("sheets", "v4", credentials=creds)
-        sheet = service.spreadsheets()
-
-        values_to_upload = []
-        with open(transactions_path, 'r') as f:
-            reader = csv.DictReader(f)
-            header = reader.fieldnames
-            rows = list(reader)
-            
-            # Sort rows by date
-            rows.sort(key=lambda x: x['date'])
-            
-            # Recalculate cumulative amount to ensure consistency
-            running_total = 0.0
-            for row in rows:
-                running_total += float(row['amount'])
-                row['cumulative_amount'] = round(running_total, 2)
-            
-            # Explicitly define headers to ensure they appear in Sheets
-            display_headers = ["Date", "Amount", "Merchant", "Category", "Cumulative Amount"]
-            values_to_upload.append(display_headers)
-            
-            # Use original keys to extract values from dicts
-            data_keys = ["date", "amount", "merchant", "category", "cumulative_amount"]
-            for row in rows:
-                values_to_upload.append([row.get(k, '') for k in data_keys])
-
-        if len(values_to_upload) <= 1:
-            print("No transaction data to upload.")
-            return
-
-        # --- Safety Check: Prevent clobbering sheet with stale data ---
-        import sys
-        if "--force" not in sys.argv:
-            try:
-                existing_res = sheet.values().get(spreadsheetId=SPREADSHEET_ID, range="Transactions!A:A").execute()
-                existing_rows = existing_res.get("values", [])
-                if existing_rows and len(existing_rows) > len(values_to_upload):
-                    print(f"ABORTED: Google Sheet currently has {len(existing_rows)} rows, but local CSV only has {len(values_to_upload)} rows.")
-                    print("Aborting upload to prevent clobbering Google Sheet with stale data.")
-                    print("To force upload anyway, pass --force.")
-                    return
-            except Exception as e:
-                print(f"Warning: Could not check existing sheet length ({e}), proceeding with upload.")
-
-        # --- Clear the existing sheet data ---
-        print("Clearing existing data from Transactions sheet...")
-        sheet.values().clear(
-            spreadsheetId=SPREADSHEET_ID, range="Transactions!A1:Z"
-        ).execute()
-
-        # --- Write the new data to the sheet ---
-        body = {"values": values_to_upload}
-        print(f"Uploading {len(values_to_upload)} rows to Google Sheet...")
-        result = (
+        existing_res = (
             sheet.values()
-            .update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=RANGE_NAME,
-                valueInputOption="USER_ENTERED",
-                body=body,
-            )
+            .get(spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A:A")
             .execute()
         )
-        print(f"{result.get('updatedCells')} cells updated.")
-        print("Upload complete.")
+        existing_rows = existing_res.get("values", [])
+        existing_row_count = len(existing_rows)
+        if not force and existing_row_count > len(values_to_upload):
+            logger.error(
+                "ABORTED: Google Sheet currently has %d rows, but local CSV only has %d rows. "
+                "Pass --force to overwrite anyway.",
+                existing_row_count,
+                len(values_to_upload),
+            )
+            return False
+    except Exception as exc:
+        logger.warning("Could not check existing sheet length (%s); proceeding with upload.", exc)
 
+    if dry_run:
+        logger.info(
+            "[DRY RUN] Would upload %d rows (%d columns) to %s!A1 (existing rows: %d).",
+            len(values_to_upload),
+            len(values_to_upload[0]),
+            sheet_name,
+            existing_row_count,
+        )
+        return True
+
+    logger.info("Uploading %d rows to Google Sheet (%s)...", len(values_to_upload), sheet_name)
+    result = (
+        sheet.values()
+        .update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_name}!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values": values_to_upload},
+        )
+        .execute()
+    )
+    logger.info("%s cells updated.", result.get("updatedCells"))
+
+    # Only clear trailing surplus rows after the update succeeded
+    if existing_row_count > len(values_to_upload):
+        trailing_start = len(values_to_upload) + 1
+        trailing_range = f"{sheet_name}!A{trailing_start}:Z{existing_row_count}"
+        logger.info("Clearing %d trailing rows (%s)...", existing_row_count - len(values_to_upload), trailing_range)
+        sheet.values().clear(spreadsheetId=spreadsheet_id, range=trailing_range).execute()
+
+    logger.info("Upload complete.")
+    return True
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Upload transactions.csv to Google Sheets.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwriting the Google Sheet even if it currently has more rows than local CSV.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and report what would be uploaded without modifying Google Sheets.",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    setup_logging(verbose=args.verbose)
+
+    config = load_config(root_dir=ROOT_DIR)
+    creds = get_credentials(config, root_dir=ROOT_DIR, port=0)
+
+    try:
+        service = build("sheets", "v4", credentials=creds)
+        ok = upload_transactions(
+            config=config,
+            service=service,
+            root_dir=ROOT_DIR,
+            force=args.force,
+            dry_run=args.dry_run,
+        )
+        return 0 if ok else 1
     except HttpError as err:
-        print(err)
+        logger.error("Google Sheets API error: %s", err)
+        return 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

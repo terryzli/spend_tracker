@@ -1,36 +1,43 @@
 {
   "venture_x": {
     "travel_credit": {
-      "keywords": ["capital one portal"],
+      "keywords": ["capital one portal", "capital one travel"],
+      "card_keywords": ["capital one", "venture x"],
       "total": 300,
       "reset_cycle": "annual"
     }
   },
   "amex_gold": {
     "dunkin_credit": {
-      "keywords": ["dunkin donut"],
+      "keywords": ["dunkin"],
+      "card_keywords": ["amex", "american express"],
       "total": 7,
       "reset_cycle": "monthly"
     },
     "uber_credit": {
-        "keywords": ["uber"],
-        "total": 10,
-        "reset_cycle": "monthly"
+      "keywords": ["uber"],
+      "card_keywords": ["amex", "american express"],
+      "total": 10,
+      "reset_cycle": "monthly"
     },
     "dining_credit": {
-        "keywords": ["grubhub", "the cheesecake factory", "five guys"],
-        "total": 10,
-        "reset_cycle": "monthly"
+      "keywords": ["grubhub", "the cheesecake factory", "five guys"],
+      "card_keywords": ["amex", "american express"],
+      "total": 10,
+      "reset_cycle": "monthly"
     },
     "resy_credit": {
-        "keywords": ["resy", "BAEKJEONG"],
-        "total": 50,
-        "reset_cycle": "biannual_jan_jun"
+      "keywords": ["resy", "BAEKJEONG"],
+      "card_keywords": ["amex", "american express"],
+      "total": 50,
+      "reset_cycle": "biannual_jan_jun"
     }
   },
   "us_altitude_reserve": {
     "travel_credit": {
       "keywords": ["uber"],
+      "categories": ["Travel", "Dining"],
+      "card_keywords": ["u.s. bank", "us bank", "altitude reserve"],
       "total": 325,
       "reset_cycle": "annual"
     }

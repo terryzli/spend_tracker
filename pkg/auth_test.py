@@ -1,32 +1,46 @@
-import os.path
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+#!/usr/bin/env python3
+"""Performs a fresh OAuth authentication flow and generates token.json."""
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+import argparse
+import os
+import sys
+from typing import List, Optional
 
-def main():
-    """Performs the console-based authentication test."""
-    creds = None
-    if os.path.exists("token.json"):
-        os.remove("token.json") # Ensure we always re-authenticate for this test
-        print("Removed existing token.json for a fresh authentication test.")
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
+from pkg.common import ROOT_DIR, get_config_path, get_credentials, load_config
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Test Google OAuth authentication and regenerate token.json.")
+    parser.add_argument("--port", type=int, default=8080, help="Local callback server port (default: 8080).")
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the authorization URL instead of launching a browser (useful for SSH/headless hosts).",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    config = load_config(root_dir=ROOT_DIR)
+    token_path = get_config_path(config, "token", "token.json", root_dir=ROOT_DIR)
+
+    if os.path.exists(token_path):
+        os.remove(token_path)
+        print(f"Removed existing {token_path} for a fresh authentication test.")
 
     try:
-        flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-        creds = flow.run_console()
-        
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-            
-        print("\nSuccessfully authenticated and created token.json!")
+        get_credentials(config, root_dir=ROOT_DIR, port=args.port, open_browser=not args.no_browser)
+        print(f"\nSuccessfully authenticated and created {token_path}!")
+        return 0
+    except Exception as exc:
+        print(f"\nAn error occurred during authentication: {exc}", file=sys.stderr)
+        return 1
 
-    except Exception as e:
-        print(f"\nAn error occurred during authentication: {e}")
 
 if __name__ == "__main__":
-    main()
-
+    sys.exit(main())

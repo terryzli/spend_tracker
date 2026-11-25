@@ -4,20 +4,22 @@ An automated financial tool that scrapes transaction emails from Gmail, categori
 
 ## Features
 
-- **Multi-Bank Support**: Automated regex parsing for:
-  - **U.S. Bank**: "Large Purchase" and "New Transaction" alerts.
-  - **American Express**: Standard transaction notifications.
+- **Multi-Bank Support & Card Detection**: Automated regex parsing and issuer/card detection for:
+  - **U.S. Bank**: "Large Purchase" and "New Transaction" alerts (e.g., Altitude Reserve).
+  - **American Express**: Standard transaction notifications (e.g., Amex Gold).
   - **Bank of America**: "Transaction exceeds limit" alerts.
-  - **Capital One**: "New transaction charged" alerts (Venture X, etc.).
-- **AI-Powered Fallback**: Uses the latest **Gemini 2.5 Flash Lite** (via the modern `google-genai` SDK) to parse unknown email formats if regex fails.
-- **Recurring Expenses**: Support for scheduled monthly transactions (e.g., donations, rent) via a private `recurring_expenses.json`.
+  - **Capital One**: "New transaction charged" alerts (e.g., Venture X).
+  - **Chase & Citi**: Structured subject and body transaction alerts.
+- **AI-Powered Fallback & Categorization**: Uses **Gemini 3.5 Flash-Lite** (configurable in `config/spend_tracker.json`, via the `google-genai` SDK) with strict structured JSON schemas, local keyword matching from `config/categories.json`, rate limiting, and retry backoff.
+- **Recurring Expenses**: Support for scheduled monthly transactions (e.g., donations, rent) via a private `recurring_expenses.json` (including automatic end-of-month clamping for days 29–31).
 - **Advanced Data Management**:
-  - **Deduplication**: Every run automatically cleans the CSV of duplicate entries.
-  - **Chronological Sorting**: Transactions are always kept in order by date.
-  - **Cumulative Spending**: A running total column is automatically calculated and synced.
+  - **Accurate Deduplication**: Tracks Gmail `msg_id` so legitimate same-day repeat purchases are preserved while duplicates are removed.
+  - **Card-Aware Benefit Tracking**: Tracks the `Card` column in both `transactions.csv` and Google Sheets so overlapping benefit keywords (like Uber across Amex Gold and U.S. Bank Altitude Reserve) aren't double-counted.
+  - **Atomic File Writes & Safe Sheets Sync**: Uses atomic file replacements locally and updates Google Sheets before clearing any trailing rows.
+  - **Chronological Sorting & Cumulative Spending**: Running total column is automatically calculated and synced.
 - **Integrations**:
-  - **Google Sheets**: Daily automated upload to a dedicated `Transactions` sheet (Dashboard friendly).
-  - **Home Assistant**: REST/Command Line sensors for real-time spending and benefit progress.
+  - **Google Sheets**: Daily automated upload (`Date`, `Amount`, `Merchant`, `Category`, `Cumulative Amount`, `Card`) to a dedicated `Transactions` sheet.
+  - **Home Assistant**: Command-line sensors for real-time spending and benefit progress.
 
 ## Setup Instructions
 
@@ -118,12 +120,45 @@ template:
         state: "{{ state_attr('sensor.spending_tracker', 'benefits')['us_altitude_reserve']['travel_credit']['remaining'] }}"
 ```
 
+Each benefit entry in `pkg/report.py` also includes `used_up` (`true`/`false`), `percent_used`, `period`, and `days_remaining` so you can create Home Assistant `binary_sensor` templates or "use-it-or-lose-it" alerts.
+
+### Credit Card Benefits & Last-4 Mapping
+- **Last-4 card mapping**: Add `"card_last4_map": {"1234": "Amex Gold", "5678": "U.S. Bank Altitude Reserve"}` in `config/spend_tracker.json` to map card alerts by last 4 digits (useful when you hold multiple cards from the same bank).
+- **Category matching**: Benefits in `config/benefits.json` support `"categories"` (e.g., `["Travel", "Dining"]` for U.S. Bank Altitude Reserve) in addition to `"keywords"`.
+- **Anniversary reset cycles**: Set `"reset_cycle": "anniversary"` with `"anniversary_month"` and `"anniversary_day"` in `config/benefits.json` for credits that reset on your cardmember anniversary instead of January 1.
+
 ### macOS (Launch Agent)
 1. Edit `scripts/com.user.gmailspendingtracker.plist` with your local paths.
 2. Move it to `~/Library/LaunchAgents/`.
 3. Load it: `launchctl load ~/Library/LaunchAgents/com.user.gmailspendingtracker.plist`.
 
+## CLI Usage
+
+```bash
+# Standard incremental sync
+./venv/bin/python main.py
+
+# Preview changes without modifying CSV, cache, or processed IDs
+./venv/bin/python main.py --dry-run -v
+
+# Search since a specific date or override the Gemini model
+./venv/bin/python main.py --since 2026-10-01 --model gemini-3.8-flash
+
+# Re-categorize all historical rows using overrides, categories.json keywords, and Gemini
+./venv/bin/python main.py --recategorize
+
+# Upload to Google Sheets (supports --dry-run and --force)
+./venv/bin/python pkg/upload_to_sheets.py --dry-run
+```
+
+## Testing
+
+```bash
+./venv/bin/pip install pytest
+./venv/bin/pytest -v
+```
+
 ## Security & Privacy
 - **Private Files**: `credentials.json`, `token.json`, `gemini_key.txt`, `transactions.csv`, and `recurring_expenses.json` are all excluded from Git.
 - **History**: The repository history has been purged of sensitive configurations.
-- **API Safety**: Gemini AI calls are strictly limited to 10 per day by default to stay within the free-tier quota.
+- **API Safety**: Gemini model, daily request limit, and RPM throttling are configurable under `"gemini"` in `config/spend_tracker.json`.

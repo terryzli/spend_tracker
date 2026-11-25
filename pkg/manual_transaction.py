@@ -1,93 +1,106 @@
-import json
+#!/usr/bin/env python3
+"""Records manual spending toward a specific credit card benefit period."""
+
+import argparse
 import os
 import sys
 from datetime import datetime
+from typing import List, Optional
 
-# Get project directories
-script_dir = os.path.dirname(os.path.abspath(__file__))
-root_dir = os.path.dirname(script_dir)
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
 
-# Path to the data files
-MANUAL_CREDITS_PATH = os.path.join(root_dir, 'config/manual_credits.json')
-BENEFITS_PATH = os.path.join(root_dir, 'config/benefits.json')
+from pkg.common import (
+    ROOT_DIR,
+    atomic_write_json,
+    get_config_path,
+    get_period_key,
+    load_config,
+    load_json_file,
+)
 
-def get_period_key(reset_cycle, date_obj):
-    """Generates a unique key for the current period based on the reset cycle."""
-    if reset_cycle == 'monthly':
-        return date_obj.strftime('%Y-%m')
-    elif reset_cycle == 'annual':
-        return date_obj.strftime('%Y')
-    elif reset_cycle == 'biannual_jan_jun':
-        period = 1 if 1 <= date_obj.month <= 6 else 2
-        return f"{date_obj.year}-P{period}"
-    return 'all'
 
-def add_manual_spend(amount, benefit_key):
-    """Records manual spending for a specific benefit period."""
-    if not os.path.exists(BENEFITS_PATH):
-        print(f"Error: benefits.json not found at {BENEFITS_PATH}.")
-        return
+def add_manual_spend(
+    amount: float,
+    benefit_key: str,
+    root_dir: str = ROOT_DIR,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Records manual spending for a specific benefit period atomically."""
+    config = load_config(root_dir=root_dir)
+    benefits_path = get_config_path(config, "benefits", "config/benefits.json", root_dir=root_dir)
+    manual_credits_path = get_config_path(
+        config, "manual_credits", "config/manual_credits.json", root_dir=root_dir
+    )
 
-    with open(BENEFITS_PATH, 'r') as f:
-        benefits_config = json.load(f)
+    if not os.path.exists(benefits_path):
+        print(f"Error: benefits.json not found at {benefits_path}.", file=sys.stderr)
+        return False
 
-    # Support "card:benefit_key" or "card.benefit_key" or "card/benefit_key"
+    benefits_config = load_json_file(benefits_path, default={})
+
+    # Support "card:benefit_key", "card.benefit_key", or "card/benefit_key"
     specified_card = None
-    for sep in [":", ".", "/"]:
+    for sep in (":", ".", "/"):
         if sep in benefit_key:
             specified_card, benefit_key = benefit_key.split(sep, 1)
             break
 
     target_card = None
-    reset_cycle = 'annual'
+    benefit_details = {}
+    reset_cycle = "annual"
 
     if specified_card and specified_card in benefits_config:
         if benefit_key in benefits_config[specified_card]:
             target_card = specified_card
-            reset_cycle = benefits_config[target_card][benefit_key].get('reset_cycle', 'annual')
+            benefit_details = benefits_config[target_card][benefit_key]
+            reset_cycle = benefit_details.get("reset_cycle", "annual")
         else:
-            print(f"Error: Benefit key '{benefit_key}' not found in card '{specified_card}'.")
-            return
+            print(
+                f"Error: Benefit key '{benefit_key}' not found in card '{specified_card}'.",
+                file=sys.stderr,
+            )
+            return False
     else:
-        # Search all cards for this benefit key
         for card, card_benefits in benefits_config.items():
             if benefit_key in card_benefits:
                 target_card = card
-                reset_cycle = card_benefits[benefit_key].get('reset_cycle', 'annual')
+                benefit_details = card_benefits[benefit_key]
+                reset_cycle = benefit_details.get("reset_cycle", "annual")
                 break
-    
+
     if not target_card:
-        print(f"Error: Benefit key '{benefit_key}' not found in {BENEFITS_PATH}.")
-        return
+        print(f"Error: Benefit key '{benefit_key}' not found in {benefits_path}.", file=sys.stderr)
+        return False
 
-    # Load existing manual spend data
-    data = {}
-    if os.path.exists(MANUAL_CREDITS_PATH):
-        with open(MANUAL_CREDITS_PATH, 'r') as f:
-            try:
-                data = json.load(f)
-            except:
-                data = {}
+    data = load_json_file(manual_credits_path, default={})
+    current = now or datetime.now()
+    period_key = get_period_key(reset_cycle, current, benefit_details=benefit_details)
 
-    now = datetime.now()
-    period_key = get_period_key(reset_cycle, now)
-    
-    if target_card not in data:
-        data[target_card] = {}
-    if benefit_key not in data[target_card]:
-        data[target_card][benefit_key] = {}
-    
-    # Add the spend to the current period's manual total
-    current_val = data[target_card][benefit_key].get(period_key, 0.0)
+    data.setdefault(target_card, {}).setdefault(benefit_key, {})
+    current_val = float(data[target_card][benefit_key].get(period_key, 0.0))
     data[target_card][benefit_key][period_key] = round(current_val + float(amount), 2)
 
-    with open(MANUAL_CREDITS_PATH, 'w') as f:
-        json.dump(data, f, indent=2)
-    
-    print(f"Recorded ${amount} manual spend for {benefit_key} ({period_key}).")
+    atomic_write_json(manual_credits_path, data)
+    print(f"Recorded ${float(amount):.2f} manual spend for {target_card}:{benefit_key} ({period_key}).")
+    return True
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Record manual spending for a credit card benefit.")
+    parser.add_argument("amount", type=float, help="Dollar amount spent.")
+    parser.add_argument(
+        "benefit_key",
+        help="Benefit key (e.g. 'uber_credit' or 'amex_gold:uber_credit').",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    return 0 if add_manual_spend(args.amount, args.benefit_key) else 1
+
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python3 manual_transaction.py <amount> <benefit_key>")
-    else:
-        add_manual_spend(sys.argv[1], sys.argv[2])
+    sys.exit(main())

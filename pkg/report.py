@@ -1,148 +1,114 @@
 #!/usr/bin/env python3
+"""Generates a JSON report of monthly/yearly spending and card benefit progress for Home Assistant."""
 
-import json
 import csv
-from datetime import datetime
+import json
 import os
+import sys
+from datetime import datetime
+from typing import Any, Dict, Optional
 
-# Get the directory of the current script and the root project directory
-script_dir = os.path.dirname(os.path.abspath(__file__))
-root_dir = os.path.dirname(script_dir)
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
 
-def load_config():
-    config_path = os.path.join(root_dir, "config/spend_tracker.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
+from pkg.common import (
+    ROOT_DIR,
+    get_config_path,
+    get_days_remaining,
+    get_period_key,
+    is_in_current_period,
+    load_config,
+    load_json_file,
+    transaction_matches_benefit,
+)
 
-def get_biannual_period(date_obj):
-    """Returns the biannual period (1 for Jan-Jun, 2 for Jul-Dec) for a given date."""
-    if 1 <= date_obj.month <= 6:
-        return 1
-    else:
-        return 2
 
-def calculate_spending():
-    """
-    Calculates total spending and benefit progress on the fly from the transactions log.
-    """
-    config = load_config()
-    
-    benefits_rel = config.get("paths", {}).get("benefits", "config/benefits.json")
-    benefits_path = os.path.join(root_dir, benefits_rel)
-    
-    transactions_rel = config.get("paths", {}).get("transactions_csv", "transactions.csv")
-    transactions_path = os.path.join(root_dir, transactions_rel)
+def calculate_spending(
+    root_dir: str = ROOT_DIR,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Calculates total spending and card-aware benefit progress from transactions.csv."""
+    config = load_config(root_dir=root_dir)
 
-    # Load benefit rules
-    with open(benefits_path, 'r') as f:
-        benefits_config = json.load(f)
-    
-    # Load manual adjustments
-    manual_path = os.path.join(root_dir, 'config/manual_credits.json')
-    manual_adjustments = {}
-    if os.path.exists(manual_path):
-        try:
-            with open(manual_path, 'r') as f:
-                manual_adjustments = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
+    benefits_path = get_config_path(config, "benefits", "config/benefits.json", root_dir=root_dir)
+    transactions_path = get_config_path(config, "transactions_csv", "transactions.csv", root_dir=root_dir)
+    manual_path = get_config_path(config, "manual_credits", "config/manual_credits.json", root_dir=root_dir)
 
-    # Initialize report structure based on benefits config
-    report = {
-        'monthly_spending': 0,
-        'yearly_spending': 0,
-        'benefits': {card: {benefit: {'spent': 0, 'total': details['total'], 'remaining': details['total']} for benefit, details in card_benefits.items()} for card, card_benefits in benefits_config.items()}
+    benefits_config = load_json_file(benefits_path, default={})
+    manual_adjustments = load_json_file(manual_path, default={})
+
+    current = now if now is not None else datetime.now().astimezone().replace(tzinfo=None)
+
+    report: Dict[str, Any] = {
+        "monthly_spending": 0.0,
+        "yearly_spending": 0.0,
+        "benefits": {},
     }
 
-    now = datetime.now()
-    # When running in HA, the timezone might be UTC. For accurate date comparison, let's use naive datetimes.
-    now = now.astimezone().replace(tzinfo=None)
-
-    # --- Apply Manual Adjustments First (so they are included in the base) ---
-    def get_period_key(reset_cycle, date_obj):
-        if reset_cycle == 'monthly':
-            return date_obj.strftime('%Y-%m')
-        elif reset_cycle == 'annual':
-            return date_obj.strftime('%Y')
-        elif reset_cycle == 'biannual_jan_jun':
-            period = 1 if 1 <= date_obj.month <= 6 else 2
-            return f"{date_obj.year}-P{period}"
-        return 'all'
-
     for card, card_benefits in benefits_config.items():
+        report["benefits"][card] = {}
         for benefit, details in card_benefits.items():
-            reset_cycle = details.get('reset_cycle', 'annual')
-            period_key = get_period_key(reset_cycle, now)
-            adj = manual_adjustments.get(card, {}).get(benefit, {}).get(period_key, 0)
-            report['benefits'][card][benefit]['spent'] += adj
+            reset_cycle = details.get("reset_cycle", "annual")
+            period_key = get_period_key(reset_cycle, current, benefit_details=details)
+            days_remaining = get_days_remaining(reset_cycle, current, benefit_details=details)
+            adj = float(manual_adjustments.get(card, {}).get(benefit, {}).get(period_key, 0.0))
+            report["benefits"][card][benefit] = {
+                "spent": adj,
+                "total": details["total"],
+                "remaining": details["total"],
+                "used_up": False,
+                "percent_used": 0.0,
+                "period": period_key,
+                "days_remaining": days_remaining,
+            }
 
-    if not os.path.exists(transactions_path):
-        return report
+    if os.path.exists(transactions_path):
+        with open(transactions_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    transaction_date = datetime.strptime(row["date"], "%Y-%m-%d")
+                    amount = float(row["amount"])
 
-    with open(transactions_path, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                # --- General Spending Calculation ---
-                transaction_date_str = row['date']
-                # Parse the 'YYYY-MM-DD' date string
-                transaction_date = datetime.strptime(transaction_date_str, '%Y-%m-%d')
+                    if transaction_date.year == current.year:
+                        report["yearly_spending"] += amount
+                        if transaction_date.month == current.month:
+                            report["monthly_spending"] += amount
 
-                if transaction_date.year == now.year:
-                    report['yearly_spending'] += float(row['amount'])
-                    if transaction_date.month == now.month:
-                        report['monthly_spending'] += float(row['amount'])
+                    for card, card_benefits in benefits_config.items():
+                        for benefit, details in card_benefits.items():
+                            reset_cycle = details.get("reset_cycle", "annual")
+                            if not is_in_current_period(
+                                reset_cycle, transaction_date, current, benefit_details=details
+                            ):
+                                continue
+                            if transaction_matches_benefit(row, details):
+                                report["benefits"][card][benefit]["spent"] += amount
+                except (ValueError, KeyError, TypeError):
+                    continue
 
-                # --- Benefit-Specific Calculation ---
-                for card, card_benefits in benefits_config.items():
-                    for benefit, details in card_benefits.items():
-                        for keyword in details['keywords']:
-                            if keyword.lower() in row['merchant'].lower():
-                                # Keyword matched, now check if it's in the current reset period
-                                reset_cycle = details.get('reset_cycle', 'annual')
-                                add_amount = False
-
-                                if reset_cycle == 'monthly':
-                                    if transaction_date.month == now.month and transaction_date.year == now.year:
-                                        add_amount = True
-                                elif reset_cycle == 'biannual_jan_jun':
-                                    if get_biannual_period(transaction_date) == get_biannual_period(now) and transaction_date.year == now.year:
-                                        add_amount = True
-                                elif reset_cycle == 'annual':
-                                    if transaction_date.year == now.year:
-                                        add_amount = True
-                                
-                                if add_amount:
-                                    report['benefits'][card][benefit]['spent'] += float(row['amount'])
-                                    # Break keyword loop once a match is found for a benefit
-                                    break
-            
-            except (ValueError, KeyError) as e:
-                # Optional: log parsing errors
-                # print(f"Skipping row due to error: {e}")
-                continue
-    
-    # Round all final values for clean output
-    report['monthly_spending'] = round(report['monthly_spending'], 2)
-    report['yearly_spending'] = round(report['yearly_spending'], 2)
-    for card in report['benefits']:
-        for benefit in report['benefits'][card]:
-            spent = round(report['benefits'][card][benefit]['spent'], 2)
-            total = report['benefits'][card][benefit]['total']
-            report['benefits'][card][benefit]['spent'] = spent
-            report['benefits'][card][benefit]['remaining'] = round(max(0, total - spent), 2)
+    # Finalize rounded totals, remaining credit, percent_used, and used_up status
+    report["monthly_spending"] = round(report["monthly_spending"], 2)
+    report["yearly_spending"] = round(report["yearly_spending"], 2)
+    for card in report["benefits"]:
+        for benefit, entry in report["benefits"][card].items():
+            spent = round(entry["spent"], 2)
+            total = entry["total"]
+            remaining = round(max(0.0, total - spent), 2)
+            entry["spent"] = spent
+            entry["remaining"] = remaining
+            entry["used_up"] = remaining <= 0.0
+            entry["percent_used"] = round(min(100.0, (spent / total) * 100.0), 1) if total > 0 else 100.0
 
     return report
 
-def main():
+
+def main() -> None:
     """Generates and prints a JSON report of spending and benefit progress."""
     report_data = calculate_spending()
     print(json.dumps(report_data, indent=2))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

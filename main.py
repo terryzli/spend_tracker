@@ -1,485 +1,454 @@
-import os.path
-import base64
-import re
+#!/usr/bin/env python3
+"""Gmail Spending Tracker: fetches bank alert emails, parses transactions, categorizes with Gemini, and writes transactions.csv."""
+
+import argparse
 import csv
-import json
+import logging
+import os
 import sys
 from datetime import datetime, timedelta
-from email.utils import parsedate_to_datetime
-from bs4 import BeautifulSoup
-from google import genai
-from google.genai import types
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# If modifying these scopes, delete the file token.json.
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+from pkg.ai import GeminiClient, match_local_category
+from pkg.common import (
+    CSV_FIELDNAMES,
+    ROOT_DIR,
+    atomic_write_csv,
+    atomic_write_text,
+    get_config_path,
+    get_credentials,
+    load_config,
+    load_json_file,
+    setup_logging,
+    transaction_matches_benefit,
+)
+from pkg.parser import (
+    apply_transaction_rules,
+    clean_merchant_name,
+    detect_card,
+    extract_email_body,
+    get_header,
+    get_recurring_expenses,
+    normalize_amount,
+    parse_email_date,
+    parse_email_regex,
+)
 
-def load_config():
-    with open("config/spend_tracker.json", "r") as f:
-        return json.load(f)
+logger = logging.getLogger(__name__)
 
-def get_gemini_usage_count(config):
-    today = datetime.now().strftime('%Y-%m-%d')
-    if os.path.exists(config["paths"]["gemini_usage"]):
-        with open(config["paths"]["gemini_usage"], 'r') as f:
-            try:
-                data = json.load(f)
-                if data.get("date") == today:
-                    return data.get("count", 0)
-            except: pass
-    return 0
+GMAIL_BASE_QUERY = (
+    '("Large Purchase" OR "Transaction Alert" OR "new transaction" OR '
+    '"exceeds alert" OR "transaction was charged" OR "transaction charged" OR '
+    '"Single Transaction Alert" OR "charged to your card" OR "charged to your account" OR '
+    '"transaction was made" OR "You made a" OR "transaction with")'
+)
 
-def increment_gemini_usage(config):
-    today = datetime.now().strftime('%Y-%m-%d')
-    count = get_gemini_usage_count(config) + 1
-    with open(config["paths"]["gemini_usage"], 'w') as f:
-        json.dump({"date": today, "count": count}, f)
 
-def load_category_cache(config):
-    path = config["paths"]["category_cache"]
+def load_processed_messages(config: Dict[str, Any], root_dir: str = ROOT_DIR) -> Set[str]:
+    path = get_config_path(config, "processed_messages", "processed_messages.txt", root_dir=root_dir)
     if os.path.exists(path):
-        with open(path, "r") as f:
-            try: return json.load(f)
-            except: return {}
-    return {}
-
-def save_category_cache(config, cache):
-    with open(config["paths"]["category_cache"], "w") as f:
-        json.dump(cache, f, indent=2)
-
-def load_category_overrides(config):
-    path = config["paths"]["category_overrides"]
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            try: return json.load(f)
-            except: return {}
-    return {}
-
-def clean_merchant_name(name):
-    """Cleans up common formatting patterns in merchant names (e.g. 'on [date] at [merchant]')."""
-    if not name:
-        return ""
-    # Strip Capital One / bank disclaimers
-    if " This may have occurred " in name:
-        name = name.split(" This may have occurred ")[0]
-    # Strip Chase / bank timestamp prefix like "5:33 PM ET Merchant " or "12:28 AM ET Merchant "
-    if " Merchant " in name:
-        name = name.split(" Merchant ")[-1]
-    # Strip trailing " Amount $..."
-    if " Amount " in name:
-        name = name.split(" Amount ")[0]
-    # Strip any leading timestamps e.g. "8:53 PM ET "
-    name = re.sub(r'^(?:\d{1,2}:\d{2}\s*(?:AM|PM)\s*(?:ET|PT|CT|MT)?\s*)', '', name, flags=re.IGNORECASE)
-    if " at " in name:
-        name = name.split(" at ")[-1]
-    name = name.strip(" '\".,")
-    return name
-
-def load_categories(config):
-    """Loads configured categories from categories.json."""
-    path = config["paths"].get("categories", "config/categories.json")
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            try: return json.load(f)
-            except: return {}
-    return {}
-
-def get_batch_ai_categories(config, merchants, cache, overrides):
-    """Categorizes multiple merchants in one Gemini call."""
-    results = {}
-    to_ask = []
-    for merchant in merchants:
-        merchant_upper = merchant.upper()
-        found = False
-        for pattern, cat in overrides.items():
-            if pattern.upper() in merchant_upper:
-                results[merchant] = cat
-                found = True
-                break
-        if not found:
-            if merchant in cache: results[merchant] = cache[merchant]
-            else: to_ask.append(merchant)
-    if not to_ask: return results
-    usage = get_gemini_usage_count(config)
-    if usage >= config["daily_limit"]:
-        for m in to_ask: results[m] = "Other"
-        return results
-    if not os.path.exists(config["paths"]["gemini_key"]): return results
-    with open(config["paths"]["gemini_key"], 'r') as f: api_key = f.read().strip()
-    try:
-        client = genai.Client(api_key=api_key)
-        merchant_list = "\n".join([f"- {m}" for m in to_ask])
-        categories = load_categories(config)
-        categories_str = ", ".join(list(categories.keys()) + ["Other"])
-        prompt = f"Categorize these merchants into one of these exact categories: {categories_str}. Return ONLY a JSON object mapping each merchant to its category.\nMerchants:\n{merchant_list}"
-        response = client.models.generate_content(model='gemini-2.5-flash-lite', contents=prompt, config=types.GenerateContentConfig(response_mime_type='application/json'))
-        increment_gemini_usage(config)
-        if response.text:
-            batch_results = json.loads(response.text.strip())
-            for m, cat in batch_results.items():
-                results[m] = cat
-                cache[m] = cat
-            save_category_cache(config, cache)
-    except:
-        for m in to_ask: results[m] = "Other"
-    return results
-
-def process_transaction_rules(transaction):
-    """Applies custom rules to modify transaction data (e.g., fixed amounts)."""
-    merchant_upper = transaction['merchant'].upper()
-    if "BAY CLUB" in merchant_upper:
-        if transaction['amount'] != "160.00":
-            print(f"  -> Applied rule: Adjusted {transaction['merchant']} amount from ${transaction['amount']} to $160.00")
-            transaction['amount'] = "160.00"
-    return transaction
-
-def parse_with_gemini(config, body):
-    if not os.path.exists(config["paths"]["gemini_key"]): return None
-    usage = get_gemini_usage_count(config)
-    if usage >= config["daily_limit"]: return None
-    with open(config["paths"]["gemini_key"], 'r') as f: api_key = f.read().strip()
-    try:
-        client = genai.Client(api_key=api_key)
-        soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
-        clean_text = ' '.join(soup_text.split())[:4000] 
-        
-        categories = load_categories(config)
-        categories_str = ", ".join(list(categories.keys()) + ["Other"])
-        
-        prompt = (
-            f"Analyze the following email from a credit card company or bank. "
-            f"Extract the transaction details and return ONLY a JSON object with these keys:\n"
-            f"- 'amount': the transaction amount (string, e.g., '230.42')\n"
-            f"- 'merchant': the clean, friendly name of the merchant (string, e.g., 'Walmart' instead of 'on May. 14, 2026, at Walmart', 'Lowe's' instead of 'on May. 16, 2026, at Lowe's', 'Google' instead of 'Google *fi')\n"
-            f"- 'date': the date of the transaction in YYYY-MM-DD format (extract from email context)\n"
-            f"- 'category': classify the transaction into one of these exact categories: {categories_str}. Choose 'Other' if it doesn't fit any.\n\n"
-            f"Email body:\n{clean_text}"
-        )
-        
-        response = client.models.generate_content(
-            model='gemini-2.5-flash-lite',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type='application/json')
-        )
-        increment_gemini_usage(config)
-        if response.text:
-            data = json.loads(response.text.strip())
-            if data and all(k in data for k in ['amount', 'merchant', 'date']):
-                data['amount'] = str(data['amount']).replace('$', '').replace(',', '')
-                data['merchant'] = clean_merchant_name(data['merchant'])
-                return data
-    except Exception as e:
-        print(f"Gemini parsing failed: {e}")
-    return None
-
-def parse_email_body(config, body, subject=""):
-    # 0. Check structured subject lines first (Chase & U.S. Bank: "You made a $X transaction with <Merchant>")
-    if subject:
-        subj_match = re.search(r"(?:made a\s+|A\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", subject, re.IGNORECASE)
-        if not subj_match:
-            subj_match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>.+)", subject, re.IGNORECASE)
-        if subj_match:
-            res = subj_match.groupdict()
-            res['amount'] = res['amount'].replace(',', '')
-            res['merchant'] = clean_merchant_name(res['merchant'])
-            return res
-
-    # 1. Try regex parsing on body (fast, free, and no rate limits)
-    try:
-        soup_text = BeautifulSoup(body, 'html.parser').get_text(separator=' ')
-        clean_soup_text = ' '.join(soup_text.split())
-        
-        # Pattern A: "Amount: $X ... Where: Y" (Bank of America format)
-        match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+).*?Where:\s+(?P<merchant>[^.\n]+?)(?:\s+View|\s+Date|\.)", clean_soup_text, re.IGNORECASE)
-
-        # Pattern B: Amex Large Purchase format ("Merchant $Amount* Day, Month Date, Year")
-        if not match:
-            match = re.search(r"(?P<merchant>[A-Za-z0-9\s#&-]{2,30}?)\s+\$(?P<amount>[\d,.]+)\*\s+[A-Za-z]{3},\s+[A-Za-z]{3}\s+\d", clean_soup_text, re.IGNORECASE)
-
-        # Pattern C: "Amount: $X ... Merchant: Y" (Amex/forwarded formats)
-        if not match:
-            match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+).*?Merchant:\s+(?P<merchant>[^.\n]+)", clean_soup_text, re.DOTALL | re.IGNORECASE)
-            
-        # Pattern D: "at Y, a pending ... amount of $X" (Capital One)
-        if not match:
-            match = re.search(r"at\s+(?P<merchant>.+?),\s+a\s+pending.*?amount\s+of\s+\$(?P<amount>[\d,.]+)", clean_soup_text, re.IGNORECASE)
-
-        # Pattern D2: Chase Body format ("Merchant <Merchant> Amount $X")
-        if not match:
-            match = re.search(r"Merchant\s+(?P<merchant>.+?)\s+Amount\s+\$(?P<amount>[\d,.]+)", clean_soup_text, re.IGNORECASE)
-
-        # Pattern D3: Citi format ("Amount: $X ... Merchant Y Date")
-        if not match:
-            match = re.search(r"Amount:\s+\$(?P<amount>[\d,.]+).*?Merchant\s+(?P<merchant>[^.\n]+?)\s+Date", clean_soup_text, re.IGNORECASE)
-
-        # Pattern D4: U.S. Bank Body format ("You made a $X transaction with Y")
-        if not match:
-            match = re.search(r"(?:made a\s+)?\$(?P<amount>[\d,.]+)\s+transaction\s+(?:at|with)\s+(?P<merchant>[^.\n]+?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved)", clean_soup_text, re.IGNORECASE)
-
-        # Pattern E: Generic Fallback (Matches "$10.00 at Starbucks", "charged $88.18 at Lowe's")
-        if not match:
-            match = re.search(r"\$(?P<amount>[\d,.]+)\s+(?:at|with)\s+(?P<merchant>[^.\n]{2,40}?)(?:\s+on|\.|\s+ending|\s+card|\s+for|\s+date|\s+was|\s+approved|$)", clean_soup_text, re.IGNORECASE)
-
-        if match:
-            res = match.groupdict()
-            res['amount'] = res['amount'].replace(',', '')
-            res['merchant'] = clean_merchant_name(res['merchant'])
-            return res
-    except Exception as e:
-        print(f"Regex parsing failed: {e}")
-        pass
-
-    # 2. Fall back to Gemini only if regex fails
-    # Since the free tier is limited to 15 Requests Per Minute (RPM), we introduce a 4.1s delay
-    import time
-    time.sleep(4.1)
-    return parse_with_gemini(config, body)
-
-def get_email_date(headers):
-    for h in headers:
-        if h["name"] == "Date": return h["value"]
-    return ""
-
-def load_benefits(config):
-    with open(config["paths"]["benefits"], "r") as f: return json.load(f)
-
-def check_benefits(transaction, benefits):
-    for card, card_benefits in benefits.items():
-        for benefit, details in card_benefits.items():
-            for keyword in details["keywords"]:
-                if keyword.lower() in transaction["merchant"].lower():
-                    print(f"  -> Found transaction for '{benefit}' credit on your {card} card.")
-                    return
-
-def load_processed_messages(config):
-    if os.path.exists(config["paths"]["processed_messages"]):
-        with open(config["paths"]["processed_messages"], "r") as f: return set(f.read().splitlines())
+        with open(path, "r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
     return set()
 
-def save_processed_messages(config, processed_ids):
-    with open(config["paths"]["processed_messages"], "w") as f:
-        for msg_id in processed_ids: f.write(f"{msg_id}\n")
 
-def process_recurring_expenses(config, processed_ids, benefits):
-    """Checks for recurring expenses that should be logged today."""
-    path = config["paths"].get("recurring_expenses", "recurring_expenses.json")
-    if not os.path.exists(path):
-        return []
+def save_processed_messages(
+    config: Dict[str, Any],
+    processed_ids: Set[str],
+    root_dir: str = ROOT_DIR,
+) -> None:
+    path = get_config_path(config, "processed_messages", "processed_messages.txt", root_dir=root_dir)
+    content = "\n".join(sorted(processed_ids)) + ("\n" if processed_ids else "")
+    atomic_write_text(path, content)
 
-    try:
-        with open(path, "r") as f:
-            recurring = json.load(f)
-    except Exception as e:
-        print(f"Error loading recurring expenses: {e}")
-        return []
 
-    now = datetime.now()
-    to_log = []
+def check_benefits(transaction: Dict[str, Any], benefits: Dict[str, Any]) -> None:
+    for card, card_benefits in benefits.items():
+        for benefit, details in card_benefits.items():
+            if transaction_matches_benefit(transaction, details):
+                logger.debug(
+                    "Matched benefit '%s' on %s for %s ($%s)",
+                    benefit,
+                    card,
+                    transaction.get("merchant"),
+                    transaction.get("amount"),
+                )
+                return
 
-    for item in recurring:
-        # Check if today is >= scheduled day and we haven't logged it for this MONTH/YEAR yet.
-        pseudo_id = f"{item['id_prefix']}_{now.strftime('%Y_%m')}"
-        
-        if now.day >= item['day'] and pseudo_id not in processed_ids:
-            transaction = {
-                "date": now.strftime("%Y-%m-%d"), # Log it as today
-                "amount": str(item['amount']),
-                "merchant": item['name'],
-                "msg_id": pseudo_id
-            }
-            to_log.append(transaction)
-            print(f"  -> Logged recurring transaction: {item['name']} (${item['amount']})")
 
-    return to_log
+def build_gmail_query(
+    config: Dict[str, Any],
+    csv_path: str,
+    full_search: bool = False,
+    since_date: Optional[str] = None,
+    backfill: bool = False,
+) -> str:
+    """Constructs the Gmail search query with optional date filtering."""
+    after_date_str = ""
+    if full_search:
+        logger.info("Full search requested: searching without date restriction.")
+    elif since_date:
+        after_date_str = f" after:{since_date}"
+        logger.info("Custom since date requested: %s", since_date)
+    elif backfill:
+        backfill_date = config.get("backfill_default_date", "2026-07-10")
+        after_date_str = f" after:{backfill_date}"
+        logger.info("Backfill requested: searching emails after %s", backfill_date)
+    elif os.path.exists(csv_path):
+        with open(csv_path, "r", encoding="utf-8", newline="") as csvfile:
+            reader = csv.DictReader(csvfile)
+            dates = [r["date"] for r in reader if r.get("date")]
+            if dates:
+                try:
+                    latest_date = max(datetime.strptime(d, "%Y-%m-%d") for d in dates)
+                    # 2-day lookback buffer accounts for timezone differences and delayed alerts.
+                    search_date = latest_date - timedelta(days=2)
+                    after_date_str = f" after:{search_date.strftime('%Y-%m-%d')}"
+                    logger.info("Restricting Gmail search to emails after %s", search_date.strftime("%Y-%m-%d"))
+                except ValueError as exc:
+                    logger.warning("Failed to parse dates from CSV (%s); running unrestricted query.", exc)
 
-def main():
-    config = load_config()
-    creds = None
-    if os.path.exists(config["paths"]["token"]): creds = Credentials.from_authorized_user_file(config["paths"]["token"], SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                creds = None
-        if not creds:
-            flow = InstalledAppFlow.from_client_secrets_file(config["paths"]["credentials"], SCOPES)
-            creds = flow.run_local_server(port=8080)
-        with open(config["paths"]["token"], "w") as token: token.write(creds.to_json())
+    return GMAIL_BASE_QUERY + after_date_str
 
-    service = build("gmail", "v1", credentials=creds)
-    benefits = load_benefits(config)
-    cache = load_category_cache(config)
-    overrides = load_category_overrides(config)
-    processed_message_ids = load_processed_messages(config)
-    new_found = False
 
-    try:
-        temp_list = []
+def deduplicate_and_finalize_rows(
+    all_rows: List[Dict[str, Any]],
+    ai_client: GeminiClient,
+    categories: Dict[str, List[str]],
+    cache: Dict[str, str],
+    overrides: Dict[str, str],
+    rules: List[Dict[str, Any]],
+    benefits: Dict[str, Any],
+    recategorize: bool = False,
+    dry_run: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Cleans, applies rules, deduplicates (preserving distinct same-day transactions with
+    different msg_ids), categorizes, sorts chronologically, and computes cumulative totals.
+    """
+    unique_rows: List[Dict[str, Any]] = []
+    seen_ids: Dict[str, int] = {}
+    legacy_by_tuple: Dict[Tuple[str, str, str], int] = {}
 
-        # --- Handle Recurring Expenses ---
-        recurring_to_log = process_recurring_expenses(config, processed_message_ids, benefits)
-        for transaction in recurring_to_log:
-            temp_list.append(transaction)
-            new_found = True
+    for raw_row in all_rows:
+        row = dict(raw_row)
+        row["merchant"] = clean_merchant_name(row.get("merchant", ""))
+        amt = normalize_amount(row.get("amount"))
+        if amt is not None:
+            row["amount"] = amt
+        row = apply_transaction_rules(row, rules)
+        row.setdefault("category", "")
+        row.setdefault("card", "")
+        row.setdefault("msg_id", "")
 
-        after_date_str = ""
-        csv_path = config["paths"]["transactions_csv"]
+        msg_id = (row.get("msg_id") or "").strip()
+        tuple_key = (row.get("date", ""), str(row.get("amount", "")), row.get("merchant", ""))
 
-        if "--all" in sys.argv or "--full" in sys.argv:
-            after_date_str = ""
-            print("Full search requested: searching without date restriction.")
-        elif any(arg.startswith("--since=") for arg in sys.argv):
-            for arg in sys.argv:
-                if arg.startswith("--since="):
-                    since_val = arg.split("=", 1)[1]
-                    after_date_str = f" after:{since_val}"
-                    print(f"Custom since date requested: {after_date_str}")
-        elif "--backfill" in sys.argv:
-            after_date_str = " after:2026-07-10"
-            print(f"Backfill requested: restricting search to emails after 2026-07-10")
-        elif os.path.exists(csv_path):
-            with open(csv_path, "r", newline="") as csvfile:
-                reader = csv.DictReader(csvfile)
-                dates = [r["date"] for r in reader if r.get("date")]
-                if dates:
-                    try:
-                        latest_date = max(datetime.strptime(d, "%Y-%m-%d") for d in dates)
-                        # Use a 2-day lookback buffer before latest_date so that all transactions
-                        # on the latest date (and timezone overlaps) are always included in Gmail search.
-                        # Already-processed transactions are skipped via processed_messages.txt.
-                        search_date = latest_date - timedelta(days=2)
-                        after_date_str = f" after:{search_date.strftime('%Y-%m-%d')}"
-                    except Exception as e:
-                        print(f"Failed to parse dates from CSV: {e}")
+        if msg_id:
+            if msg_id in seen_ids:
+                continue
+            if tuple_key in legacy_by_tuple:
+                # Upgrade existing legacy row in-place with msg_id and card info
+                idx = legacy_by_tuple.pop(tuple_key)
+                unique_rows[idx]["msg_id"] = msg_id
+                if not unique_rows[idx].get("card") and row.get("card"):
+                    unique_rows[idx]["card"] = row["card"]
+                seen_ids[msg_id] = idx
+                continue
+            seen_ids[msg_id] = len(unique_rows)
+            unique_rows.append(row)
+        else:
+            if tuple_key in legacy_by_tuple:
+                continue
+            legacy_by_tuple[tuple_key] = len(unique_rows)
+            unique_rows.append(row)
 
-        query = (
-            '("Large Purchase" OR "Transaction Alert" OR "new transaction" OR '
-            '"exceeds alert" OR "transaction was charged" OR "transaction charged" OR '
-            '"Single Transaction Alert" OR "charged to your card" OR "charged to your account" OR '
-            '"transaction was made" OR "You made a" OR "transaction with")'
+    # Always apply explicit category_overrides to all rows (even already categorized ones)
+    for row in unique_rows:
+        override_cat = match_local_category(
+            merchant=row["merchant"],
+            overrides=overrides,
+            categories={},
+            cache={},
+            use_cache=False,
         )
-        if after_date_str:
-            query += after_date_str
-            print(f"Restricting search query with date: {after_date_str}")
-        
-        messages = []
+        if override_cat is not None:
+            row["category"] = override_cat
+
+    # Collect merchants that need categorization
+    merchants_to_cat: List[str] = []
+    seen_merchants: Set[str] = set()
+    for row in unique_rows:
+        needs_cat = recategorize or not row.get("category") or row["category"] in ("Other", "")
+        if needs_cat and row["merchant"] not in seen_merchants:
+            merchants_to_cat.append(row["merchant"])
+            seen_merchants.add(row["merchant"])
+
+    if merchants_to_cat:
+        batch_cats = ai_client.categorize_merchants(
+            merchants=merchants_to_cat,
+            categories=categories,
+            cache=cache,
+            overrides=overrides,
+            use_cache=not recategorize,
+            save_cache=not dry_run,
+        )
+        for row in unique_rows:
+            if recategorize or not row.get("category") or row["category"] in ("Other", ""):
+                row["category"] = batch_cats.get(row["merchant"], row.get("category") or "Other")
+
+    unique_rows.sort(key=lambda r: r.get("date", ""))
+
+    running_total = 0.0
+    for row in unique_rows:
+        try:
+            running_total += float(row["amount"])
+        except (ValueError, TypeError):
+            logger.warning("Invalid amount in row %s", row)
+        row["cumulative_amount"] = f"{running_total:.2f}"
+        check_benefits(row, benefits)
+
+    return unique_rows
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scrape bank transaction emails from Gmail, categorize with Gemini, and update transactions.csv."
+    )
+    date_group = parser.add_mutually_exclusive_group()
+    date_group.add_argument(
+        "--all",
+        "--full",
+        dest="full_search",
+        action="store_true",
+        help="Search all Gmail messages without date restriction.",
+    )
+    date_group.add_argument(
+        "--since",
+        metavar="YYYY-MM-DD",
+        help="Search Gmail messages after this date (YYYY-MM-DD).",
+    )
+    date_group.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Search Gmail messages after the configured backfill_default_date.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and parse transactions without writing CSV, cache, or processed IDs.",
+    )
+    parser.add_argument(
+        "--recategorize",
+        action="store_true",
+        help="Re-evaluate categories for all existing transactions using overrides, keywords, and Gemini.",
+    )
+    parser.add_argument(
+        "--model",
+        help="Override the Gemini model configured in config/spend_tracker.json.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose debug logging.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    setup_logging(verbose=args.verbose)
+
+    config = load_config(root_dir=ROOT_DIR)
+    csv_path = get_config_path(config, "transactions_csv", "transactions.csv", root_dir=ROOT_DIR)
+    benefits_path = get_config_path(config, "benefits", "config/benefits.json", root_dir=ROOT_DIR)
+    categories_path = get_config_path(config, "categories", "config/categories.json", root_dir=ROOT_DIR)
+    overrides_path = get_config_path(config, "category_overrides", "config/category_overrides.json", root_dir=ROOT_DIR)
+    cache_path = get_config_path(config, "category_cache", "category_cache.json", root_dir=ROOT_DIR)
+
+    benefits = load_json_file(benefits_path, default={})
+    categories = load_json_file(categories_path, default={})
+    overrides = load_json_file(overrides_path, default={})
+    cache = load_json_file(cache_path, default={})
+    rules = config.get("transaction_rules", [])
+    processed_message_ids = load_processed_messages(config, root_dir=ROOT_DIR)
+
+    creds = get_credentials(config, root_dir=ROOT_DIR)
+    service = build("gmail", "v1", credentials=creds)
+    ai_client = GeminiClient(config, model=args.model, root_dir=ROOT_DIR)
+
+    stats = {
+        "messages_fetched": 0,
+        "skipped_processed": 0,
+        "parsed_regex": 0,
+        "parsed_gemini": 0,
+        "skipped_non_transaction": 0,
+        "parse_errors": 0,
+        "recurring_added": 0,
+    }
+    new_transactions: List[Dict[str, Any]] = []
+    processed_changed = False
+
+    try:
+        # 1. Recurring expenses
+        recurring_txs = get_recurring_expenses(config, processed_message_ids, root_dir=ROOT_DIR)
+        for tx in recurring_txs:
+            new_transactions.append(tx)
+            processed_message_ids.add(tx["msg_id"])
+            processed_changed = True
+            stats["recurring_added"] += 1
+
+        # 2. Fetch Gmail messages
+        query = build_gmail_query(
+            config=config,
+            csv_path=csv_path,
+            full_search=args.full_search,
+            since_date=args.since,
+            backfill=args.backfill,
+        )
+
+        messages: List[Dict[str, Any]] = []
         next_page_token = None
         while True:
-            results = service.users().messages().list(
-                userId="me", 
-                q=query, 
-                pageToken=next_page_token
-            ).execute()
+            results = (
+                service.users()
+                .messages()
+                .list(userId="me", q=query, pageToken=next_page_token)
+                .execute()
+            )
             messages.extend(results.get("messages", []))
             next_page_token = results.get("nextPageToken")
             if not next_page_token:
                 break
 
+        stats["messages_fetched"] = len(messages)
+        logger.info("Found %d matching Gmail messages.", len(messages))
+
         for message in messages:
-            if message["id"] in processed_message_ids: continue
-            msg = service.users().messages().get(userId="me", id=message["id"], format="full").execute()
-            payload = msg["payload"]
-            
-            subject = ""
-            for h in payload.get("headers", []):
-                if h["name"] == "Subject":
-                    subject = h["value"]
-                    break
-            print(f"DEBUG: Processing email with subject: '{subject}' (ID: {message['id']})")
-            
-            def get_html_body(p):
-                if p.get("mimeType") == "text/html" and p.get("body", {}).get("data"):
-                    return base64.urlsafe_b64decode(p["body"]["data"]).decode("utf-8")
-                if "parts" in p:
-                    for part in p["parts"]:
-                        b = get_html_body(part)
-                        if b: return b
-                return ""
-            
-            body = get_html_body(payload)
-            if not body and "body" in payload and payload["body"].get("data"):
-                body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
-            transaction = parse_email_body(config, body, subject=subject)
+            msg_id = message["id"]
+            if msg_id in processed_message_ids:
+                stats["skipped_processed"] += 1
+                continue
+
+            msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+            payload = msg.get("payload", {})
+            headers = payload.get("headers", [])
+            subject = get_header(headers, "Subject")
+            from_header = get_header(headers, "From")
+            email_date = parse_email_date(headers)
+
+            logger.debug("Processing email '%s' from '%s' (ID: %s)", subject, from_header, msg_id)
+
+            raw_body, clean_text = extract_email_body(payload)
+            detected_card = detect_card(
+                from_header=from_header,
+                subject=subject,
+                body_text=clean_text,
+                card_last4_map=config.get("card_last4_map"),
+            )
+
+            transaction = parse_email_regex(raw_body or clean_text, subject=subject)
             if transaction:
-                transaction = process_transaction_rules(transaction)
-                transaction['merchant'] = clean_merchant_name(transaction['merchant'])
-                if "date" not in transaction:
-                    try:
-                        raw_date = get_email_date(payload["headers"])
-                        date_obj = parsedate_to_datetime(raw_date)
-                        transaction["date"] = date_obj.strftime('%Y-%m-%d')
-                    except Exception:
-                        try:
-                            clean_date = re.sub(r'\s*\([^)]*\)', '', raw_date).strip()
-                            date_obj = datetime.strptime(clean_date, '%a, %d %b %Y %H:%M:%S %z')
-                            transaction["date"] = date_obj.strftime('%Y-%m-%d')
-                        except Exception:
-                            transaction["date"] = datetime.now().strftime('%Y-%m-%d')
-                transaction['msg_id'] = message["id"]
-                temp_list.append(transaction)
-                new_found = True
-
-        if temp_list:
-            file_exists = os.path.exists(config["paths"]["transactions_csv"])
-            with open(config["paths"]["transactions_csv"], "a", newline="") as csvfile:
-                fieldnames = ["date", "amount", "merchant", "category", "cumulative_amount"]
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                if not file_exists: writer.writeheader()
-                for t in temp_list:
-                    msg_id = t.pop('msg_id')
-                    writer.writerow(t)
+                stats["parsed_regex"] += 1
+            else:
+                parse_res = ai_client.parse_transaction_email(
+                    clean_text=clean_text,
+                    categories=categories,
+                    subject=subject,
+                    from_header=from_header,
+                    email_date=email_date,
+                )
+                if parse_res.status == "parsed" and parse_res.transaction:
+                    transaction = parse_res.transaction
+                    stats["parsed_gemini"] += 1
+                elif parse_res.status == "not_transaction":
+                    # Mark non-transaction emails as processed so we don't re-send them to Gemini!
                     processed_message_ids.add(msg_id)
+                    processed_changed = True
+                    stats["skipped_non_transaction"] += 1
+                    logger.debug("Marked non-transaction email %s as processed.", msg_id)
+                    continue
+                else:
+                    # Leave unprocessed on API error / quota limit so it retries next run.
+                    stats["parse_errors"] += 1
+                    logger.warning(
+                        "Skipping email %s due to %s (will retry on next run).",
+                        msg_id,
+                        parse_res.status,
+                    )
+                    continue
 
-        if os.path.exists(config["paths"]["transactions_csv"]):
-            all_rows = []
-            with open(config["paths"]["transactions_csv"], "r", newline="") as csvfile:
-                reader = csv.DictReader(csvfile)
-                all_rows = list(reader)
-            if all_rows:
-                # Clean up all merchant names in the history first
-                for row in all_rows:
-                    row['merchant'] = clean_merchant_name(row['merchant'])
-                    row = process_transaction_rules(row)
+            transaction = apply_transaction_rules(transaction, rules)
+            transaction["merchant"] = clean_merchant_name(transaction["merchant"])
+            transaction.setdefault("date", email_date)
+            if not transaction.get("card"):
+                transaction["card"] = detected_card
+            transaction["msg_id"] = msg_id
 
-                # Now get the unique set of merchants that need categorization
-                merchants_to_cat = list(set(r['merchant'] for r in all_rows if not r.get('category') or r['category'] in ['Other', '']))
-                batch_cats = get_batch_ai_categories(config, merchants_to_cat, cache, overrides)
-                unique_rows = []
-                seen = set()
-                for row in all_rows:
-                    row_key = (row['date'], row['amount'], row['merchant'])
-                    if row_key not in seen:
-                        if not row.get('category') or row['category'] in ['Other', '']:
-                            row['category'] = batch_cats.get(row['merchant'], 'Other')
-                        unique_rows.append(row)
-                        seen.add(row_key)
-                unique_rows.sort(key=lambda x: x['date'])
-                total = 0.0
-                for row in unique_rows:
-                    total += float(row['amount'])
-                    row['cumulative_amount'] = round(total, 2)
-                    check_benefits(row, benefits)
-                with open(config["paths"]["transactions_csv"], "w", newline="") as csvfile:
-                    fieldnames = ["date", "amount", "merchant", "category", "cumulative_amount"]
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(unique_rows)
+            new_transactions.append(transaction)
+            processed_message_ids.add(msg_id)
+            processed_changed = True
 
-    except HttpError as e: print(f"Error: {e}")
+        # 3. Merge with existing CSV, deduplicate, categorize, sort, and persist atomically
+        existing_rows: List[Dict[str, Any]] = []
+        if os.path.exists(csv_path):
+            with open(csv_path, "r", encoding="utf-8", newline="") as csvfile:
+                existing_rows = list(csv.DictReader(csvfile))
+
+        combined_rows = existing_rows + new_transactions
+        if combined_rows:
+            final_rows = deduplicate_and_finalize_rows(
+                all_rows=combined_rows,
+                ai_client=ai_client,
+                categories=categories,
+                cache=cache,
+                overrides=overrides,
+                rules=rules,
+                benefits=benefits,
+                recategorize=args.recategorize,
+                dry_run=args.dry_run,
+            )
+            if args.dry_run:
+                logger.info(
+                    "[DRY RUN] Would write %d total transactions (%d new) to %s.",
+                    len(final_rows),
+                    len(new_transactions),
+                    csv_path,
+                )
+            else:
+                atomic_write_csv(csv_path, CSV_FIELDNAMES, final_rows)
+                logger.info(
+                    "Saved %d total transactions (%d new) to %s.",
+                    len(final_rows),
+                    len(new_transactions),
+                    csv_path,
+                )
+
+    except HttpError as err:
+        logger.error("Gmail API error: %s", err)
+        return 1
     finally:
-        if new_found: 
-            save_processed_messages(config, processed_message_ids)
-            print("Updates complete.")
+        if processed_changed and not args.dry_run:
+            save_processed_messages(config, processed_message_ids, root_dir=ROOT_DIR)
+
+    logger.info(
+        "Run summary (model=%s): fetched=%d, already_processed=%d, regex=%d, gemini=%d, "
+        "non_tx_skipped=%d, recurring=%d, errors=%d",
+        ai_client.model,
+        stats["messages_fetched"],
+        stats["skipped_processed"],
+        stats["parsed_regex"],
+        stats["parsed_gemini"],
+        stats["skipped_non_transaction"],
+        stats["recurring_added"],
+        stats["parse_errors"],
+    )
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

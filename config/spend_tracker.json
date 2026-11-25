@@ -12,7 +12,26 @@
     "upload_log": "upload_daemon.log",
     "upload_err": "upload_daemon.err",
     "recurring_expenses": "recurring_expenses.json",
-    "categories": "config/categories.json"
+    "categories": "config/categories.json",
+    "manual_credits": "config/manual_credits.json"
   },
+  "gemini": {
+    "model": "gemini-3.5-flash-lite",
+    "daily_limit": 500,
+    "requests_per_minute": 15,
+    "max_retries": 3
+  },
+  "google_sheets": {
+    "spreadsheet_id": "14upQxkTP0ZI3cfJTKzH0DcFnerBBvSy2RPy6Posgdow",
+    "sheet_name": "Transactions"
+  },
+  "transaction_rules": [
+    {
+      "merchant_contains": "BAY CLUB",
+      "set_amount": "160.00"
+    }
+  ],
+  "card_last4_map": {},
+  "backfill_default_date": "2026-07-10",
   "daily_limit": 500
 }
